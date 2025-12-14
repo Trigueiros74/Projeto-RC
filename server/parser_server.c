@@ -86,21 +86,29 @@ static int validate_name_str(const char *s) {
 }
 
 static int validate_date_str(const char *s) {
-    /* dd-mm-yyyy basic validation */
-    if (!s) return 0;
-    if (strlen(s) != 10) return 0; /* "dd-mm-yyyy" */
-    if (s[2] != '-' || s[5] != '-') return 0;
+    /* dd-mm-yyyy hh:mm format (16 chars) */
+    if (!s || strlen(s) != 16) return 0;
+    if (s[2] != '-' || s[5] != '-' || s[10] != ' ' || s[13] != ':') return 0;
+    
     char dd[3] = {s[0], s[1], '\0'};
     char mm[3] = {s[3], s[4], '\0'};
     char yyyy[5] = {s[6], s[7], s[8], s[9], '\0'};
-    if (!is_number_str(mm) || !is_number_str(dd) || !is_number_str(yyyy)) return 0;
-    int mi = atoi(mm), di = atoi(dd), yi = atoi(yyyy);
-    if (mi < 1 || mi > 12) return 0;
-    if (yi < 1900 || yi > 9999) return 0;
+    char hh[3] = {s[11], s[12], '\0'};
+    char min[3] = {s[14], s[15], '\0'};
+    
+    if (!is_number_str(dd) || !is_number_str(mm) || !is_number_str(yyyy) ||
+        !is_number_str(hh) || !is_number_str(min)) return 0;
+    
+    int di = atoi(dd), mi = atoi(mm), yi = atoi(yyyy);
+    int hi = atoi(hh), mini = atoi(min);
+    
+    if (mi < 1 || mi > 12 || yi < 1900 || yi > 9999) return 0;
+    if (hi < 0 || hi > 23 || mini < 0 || mini > 59) return 0;
+    
     int mdays = 31;
     if (mi == 4 || mi == 6 || mi == 9 || mi == 11) mdays = 30;
     else if (mi == 2) {
-        int leap = ( (yi % 4 == 0 && yi % 100 != 0) || (yi % 400 == 0) );
+        int leap = ((yi % 4 == 0 && yi % 100 != 0) || (yi % 400 == 0));
         mdays = leap ? 29 : 28;
     }
     if (di < 1 || di > mdays) return 0;
@@ -192,17 +200,65 @@ int parse_lmr(char *buffer, char *uid, char *password) {
 }
 
 /* ----------------- TCP parsers -----------------
-   parse_cre_header:
-     header (up to first '\n') format:
-     CRE UID password name event_date attendance_size Fname\n
-     This function parses only the header line and validates the fields.
+   parse_cre_header: CRE UID password name event_date attendance_size Fname\n
+   event_date is dd-mm-yyyy hh:mm (16 chars with space)
 */
 int parse_cre_header(char *header, char *uid, char *password, char *name, char *event_date, int *attendance_size, char *fname) {
-    char extra[2];
+    char *p = header;
+    
+    /* Skip "CRE " */
+    while (*p && *p != ' ') p++;
+    if (*p == ' ') p++;
+    
+    /* UID (6 chars) */
+    char *uid_start = p;
+    while (*p && *p != ' ') p++;
+    size_t uid_len = p - uid_start;
+    if (uid_len != 6) return 1;
+    memcpy(uid, uid_start, uid_len);
+    uid[uid_len] = '\0';
+    if (*p == ' ') p++;
+    
+    /* password */
+    char *pass_start = p;
+    while (*p && *p != ' ') p++;
+    size_t pass_len = p - pass_start;
+    if (pass_len >= 128) return 1;
+    memcpy(password, pass_start, pass_len);
+    password[pass_len] = '\0';
+    if (*p == ' ') p++;
+    
+    /* name */
+    char *name_start = p;
+    while (*p && *p != ' ') p++;
+    size_t name_len = p - name_start;
+    if (name_len > 10) return 1;
+    memcpy(name, name_start, name_len);
+    name[name_len] = '\0';
+    if (*p == ' ') p++;
+    
+    /* event_date (16 chars: dd-mm-yyyy hh:mm) */
+    if (strlen(p) < 16) return 1;
+    memcpy(event_date, p, 16);
+    event_date[16] = '\0';
+    p += 16;
+    if (*p == ' ') p++;
+    
+    /* attendance_size */
     int asize;
-    int ret = sscanf(header, "%*s %6s %127s %10s %10s %d %24s %1s",
-                     uid, password, name, event_date, &asize, fname, extra);
-    if (ret != 6) return 1;
+    if (sscanf(p, "%d", &asize) != 1) return 1;
+    while (*p && *p != ' ') p++;
+    if (*p == ' ') p++;
+    
+    /* fname */
+    char *fname_start = p;
+    while (*p && *p != ' ' && *p != '\n' && *p != '\r') p++;
+    size_t fname_len = p - fname_start;
+    if (fname_len > 24) return 1;
+    memcpy(fname, fname_start, fname_len);
+    fname[fname_len] = '\0';
+    
+    /* Validate */
     if (!validate_uid_str(uid)) return 1;
     if (!validate_password_str(password)) return 1;
     if (!validate_name_str(name)) return 1;

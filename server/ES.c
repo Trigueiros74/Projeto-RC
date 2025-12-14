@@ -242,8 +242,6 @@ int server_udp(int fd_udp, int verbose) {
 */
 int server_tcp(int fd_tcp, int verbose) {
     char command[8];
-    char host[NI_MAXHOST], port[NI_MAXSERV];
-    ssize_t bytes_read = 0;
     int invalid_req = 0;
     size_t req_len = 0;
     char *request = read_all_from_fd(fd_tcp, &req_len);
@@ -271,68 +269,127 @@ int server_tcp(int fd_tcp, int verbose) {
 
     if(invalid_req != 2) {
         if(strcmp(command, "CRE") == 0) {
-            /* CRE has a header line:
-               CRE UID password name event_date attendance_size Fname\n
-               followed by: Fsize<space><Fdata> (Fdata may contain binary)
+            /* CRE format: CRE UID password name event_date attendance_size Fname Fsize <Fdata>
+               No newline in the middle - Fsize comes right after Fname
             */
-            /* find header line end */
-            char *newline = memchr(request, '\n', req_len);
-            if(!newline) {
+            char uid[8] = {0}, password[128] = {0}, name[16] = {0}, event_date[17] = {0}, fname[32] = {0};
+            int attendance_size = 0;
+            
+            /* Manual parsing because event_date has space (16 chars: dd-mm-yyyy hh:mm) */
+            char *p = request;
+            
+            /* Skip "CRE " */
+            while (*p && *p != ' ') p++;
+            if (*p == ' ') p++;
+            
+            /* UID (6 chars) */
+            char *uid_start = p;
+            while (*p && *p != ' ') p++;
+            size_t uid_len = p - uid_start;
+            if (uid_len != 6) {
                 invalid_req = 1;
                 response_buf = strdup("RCE ERR\n");
                 response_len = strlen(response_buf);
-            } else {
-                size_t hdr_len = newline - request;
-                char hdr[1024];
-                if(hdr_len >= sizeof(hdr)) {
-                    invalid_req = 1;
-                    response_buf = strdup("RCE ERR\n");
-                    response_len = strlen(response_buf);
-                } else {
-                    memcpy(hdr, request, hdr_len);
-                    hdr[hdr_len] = '\0';
-                    /* parse header */
-                    char uid[8] = {0}, password[128] = {0}, name[16] = {0}, event_date[16] = {0}, fname[32] = {0};
-                    int attendance_size = 0;
-                    if(parse_cre_header(hdr, uid, password, name, event_date, &attendance_size, fname) != 0) {
-                        invalid_req = 1;
-                        response_buf = strdup("RCE ERR\n");
-                        response_len = strlen(response_buf);
-                    } else {
-                        /* parse Fsize and Fdata from the rest */
-                        char *rest = newline + 1;
-                        size_t rest_len = req_len - (hdr_len + 1);
-                        /* parse integer Fsize using %n */
-                        int fsize = 0;
-                        int nconsumed = 0;
-                        if(rest_len == 0 || sscanf(rest, "%d%n", &fsize, &nconsumed) != 1) {
-                            invalid_req = 1;
-                            response_buf = strdup("RCE ERR\n");
-                            response_len = strlen(response_buf);
-                        } else {
-                            /* move pointer to file data */
-                            char *p_after_num = rest + nconsumed;
-                            /* skip single space if present */
-                            if ((size_t)(p_after_num - rest) < rest_len && *p_after_num == ' ')
-                                p_after_num++;
-                            size_t available = rest + rest_len - p_after_num;
-                            if((int)available < fsize) {
-                                /* incomplete file in request */
-                                invalid_req = 1;
-                                response_buf = strdup("RCE ERR\n");
-                                response_len = strlen(response_buf);
-                            } else {
-                                /* call command handler which should create local file and return response */
-                                if(cmd_cre(&response_buf, &response_len, uid, password, name, event_date, attendance_size, fname, fsize, p_after_num) != 0) {
-                                    free(response_buf);
-                                    response_buf = strdup("RCE NOK\n");
-                                    response_len = strlen(response_buf);
-                                }
-                            }
-                        }
-                    }
-                }
+                goto cre_done;
             }
+            memcpy(uid, uid_start, uid_len);
+            uid[uid_len] = '\0';
+            if (*p == ' ') p++;
+            
+            /* password */
+            char *pass_start = p;
+            while (*p && *p != ' ') p++;
+            size_t pass_len = p - pass_start;
+            if (pass_len >= 128) {
+                invalid_req = 1;
+                response_buf = strdup("RCE ERR\n");
+                response_len = strlen(response_buf);
+                goto cre_done;
+            }
+            memcpy(password, pass_start, pass_len);
+            password[pass_len] = '\0';
+            if (*p == ' ') p++;
+            
+            /* name */
+            char *name_start = p;
+            while (*p && *p != ' ') p++;
+            size_t name_len = p - name_start;
+            if (name_len > 10) {
+                invalid_req = 1;
+                response_buf = strdup("RCE ERR\n");
+                response_len = strlen(response_buf);
+                goto cre_done;
+            }
+            memcpy(name, name_start, name_len);
+            name[name_len] = '\0';
+            if (*p == ' ') p++;
+            
+            /* event_date (16 chars: dd-mm-yyyy hh:mm) */
+            if ((size_t)(p - request) + 16 > req_len) {
+                invalid_req = 1;
+                response_buf = strdup("RCE ERR\n");
+                response_len = strlen(response_buf);
+                goto cre_done;
+            }
+            memcpy(event_date, p, 16);
+            event_date[16] = '\0';
+            p += 16;
+            if (*p == ' ') p++;
+            
+            /* attendance_size */
+            int n;
+            if (sscanf(p, "%d%n", &attendance_size, &n) != 1) {
+                invalid_req = 1;
+                response_buf = strdup("RCE ERR\n");
+                response_len = strlen(response_buf);
+                goto cre_done;
+            }
+            p += n;
+            if (*p == ' ') p++;
+            
+            /* fname */
+            char *fname_start = p;
+            while (*p && *p != ' ') p++;
+            size_t fname_len = p - fname_start;
+            if (fname_len > 24) {
+                invalid_req = 1;
+                response_buf = strdup("RCE ERR\n");
+                response_len = strlen(response_buf);
+                goto cre_done;
+            }
+            memcpy(fname, fname_start, fname_len);
+            fname[fname_len] = '\0';
+            if (*p == ' ') p++;
+            
+            /* Fsize */
+            int fsize = 0;
+            if (sscanf(p, "%d%n", &fsize, &n) != 1) {
+                invalid_req = 1;
+                response_buf = strdup("RCE ERR\n");
+                response_len = strlen(response_buf);
+                goto cre_done;
+            }
+            p += n;
+            if (*p == ' ') p++;
+            
+            /* Fdata (remaining bytes) */
+            char *fdata = p;
+            size_t available = request + req_len - fdata;
+            if ((int)available < fsize) {
+                invalid_req = 1;
+                response_buf = strdup("RCE ERR\n");
+                response_len = strlen(response_buf);
+                goto cre_done;
+            }
+            
+            /* Call command handler */
+            if(cmd_cre(&response_buf, &response_len, uid, password, name, event_date, attendance_size, fname, fsize, fdata) != 0) {
+                free(response_buf);
+                response_buf = strdup("RCE NOK\n");
+                response_len = strlen(response_buf);
+            }
+            
+            cre_done:;
         }
         else if(strcmp(command, "CLS") == 0) {
             char uid[8] = {0}, password[128] = {0}, eid[8] = {0};
@@ -556,6 +613,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Initialize persistence system and load data from disk */
+    if (init_persistence() == -1) {
+        fprintf(stderr, "Warning: Failed to initialize persistence system\n");
+    }
 
     FD_ZERO(&inputs);
     FD_SET(fd_udp, &inputs);

@@ -58,13 +58,13 @@ int validate_string_spaces(const char *str, int limit) {
     return 0;
 }
 
-int send_udp_request(char *request, int fd_udp, struct addrinfo *res, char *response) {
+int send_udp_request(char *request, int fd_udp, struct addrinfo *res, char *response, size_t response_cap) {
     int error = 1;
     ssize_t bytes_sent = sendto(fd_udp, request, strlen(request) * sizeof(char), 0, res->ai_addr,res->ai_addrlen);
     if(bytes_sent < 0) return 1;
 
     for (int tries = 0; tries < TRY_LIMIT ; tries++) {
-        ssize_t bytes_received = recvfrom(fd_udp, response, RESPONSE_LEN, 0, NULL, NULL);
+        ssize_t bytes_received = recvfrom(fd_udp, response, response_cap - 1, 0, NULL, NULL);
 
         if(bytes_received >= 0) {
             response[bytes_received] = '\0';
@@ -184,7 +184,7 @@ int cmd_login(char *request, unsigned int *user_id, int *logged_in, int fd_udp, 
     char status[6];
     char uid_str[16];
 
-    if(send_udp_request(request, fd_udp, res, response) == 1) {
+    if(send_udp_request(request, fd_udp, res, response, RESPONSE_LEN) == 1) {
         fprintf(stderr, "Error while communicating with server! Ending session.\n");
         return 1;
     }
@@ -297,7 +297,7 @@ int cmd_unregister(char *request, unsigned int *user_id, int *logged_in, int fd_
     char status[8];
     char extra[2];
 
-    if(send_udp_request(request, fd_udp, res, response) == 1) {
+    if(send_udp_request(request, fd_udp, res, response, RESPONSE_LEN) == 1) {
         fprintf(stderr, "Error while communicating with server! Ending session.\n");
         return 1;
     }
@@ -344,7 +344,7 @@ int cmd_logout(char *request, unsigned int *user_id, int *logged_in, int fd_udp,
     char status[8];
     char extra[2];
 
-    if(send_udp_request(request, fd_udp, res, response) == 1) {
+    if(send_udp_request(request, fd_udp, res, response, RESPONSE_LEN) == 1) {
         fprintf(stderr, "Error while communicating with server! Ending session.\n");
         return 1;
     }
@@ -396,12 +396,34 @@ int cmd_create(char *request, struct addrinfo *res) {
     char uid[16];
     char password[128];
     char name[64];
-    char event_date[16];
+    char event_date[20];
     unsigned int num_attendees = 0;
     char fname[256];
 
-    if(sscanf(request, "CRE %15s %127s %63s %15s %u %255s", uid, password, name, event_date, &num_attendees, fname) != 6) {
+    // Manual parsing because event_date contains space (dd-mm-yyyy hh:mm = 16 chars)
+    // Format: CRE UID password name event_date attendance_size Fname
+    int n;
+    if(sscanf(request, "CRE %15s %127s %63s%n", uid, password, name, &n) != 3) {
         fprintf(stderr, "Invalid create request header!\n");
+        return 1;
+    }
+    
+    // Move pointer past "CRE UID password name "
+    char *ptr = request + n;
+    while (*ptr == ' ') ptr++;
+    
+    // Extract exactly 16 characters for event_date
+    if (strlen(ptr) < 16) {
+        fprintf(stderr, "Invalid create request: event_date too short!\n");
+        return 1;
+    }
+    strncpy(event_date, ptr, 16);
+    event_date[16] = '\0';
+    ptr += 16;
+    
+    // Skip space and read num_attendees and fname
+    if (sscanf(ptr, " %u %255s", &num_attendees, fname) != 2) {
+        fprintf(stderr, "Invalid create request: missing attendees or filename!\n");
         return 1;
     }
 
@@ -423,18 +445,33 @@ int cmd_create(char *request, struct addrinfo *res) {
     }
     fclose(f);
 
-    /* build payload: header (request already ends with '\n'), then: <fsize><space><file-bytes> */
+    /* build payload: "CRE UID password name event_date attendance_size Fname Fsize " + file_bytes
+       Note: request comes with '\n' at the end, we need to remove it and add Fsize instead */
+    
+    // Remove trailing '\n' from request if present
+    size_t req_len = strlen(request);
+    if (req_len > 0 && request[req_len - 1] == '\n') {
+        req_len--;
+    }
+    
     char fsize_str[32];
-    int fslen = snprintf(fsize_str, sizeof fsize_str, "%zu", fsize);
-    size_t header_len = strlen(request);
-    size_t payload_len = header_len + (size_t)fslen + 1 + fsize;
+    int fslen = snprintf(fsize_str, sizeof fsize_str, " %zu ", fsize);
+    
+    size_t payload_len = req_len + (size_t)fslen + fsize;
     char *payload = malloc(payload_len);
     if(!payload) { free(fdata); fprintf(stderr, "Out of memory\n"); return 1; }
+    
     size_t off = 0;
-    memcpy(payload + off, request, header_len); off += header_len;
-    memcpy(payload + off, fsize_str, fslen); off += fslen;
-    payload[off++] = ' ';
-    if(fsize > 0) { memcpy(payload + off, fdata, fsize); off += fsize; }
+    memcpy(payload + off, request, req_len); off += req_len;      // Header sem '\n'
+    memcpy(payload + off, fsize_str, fslen); off += fslen;         // " Fsize "
+    if(fsize > 0) { memcpy(payload + off, fdata, fsize); off += fsize; }  // File bytes
+
+    printf("Debug: Comando CRE completo: \"");
+    fwrite(payload, 1, req_len + fslen, stdout);  // Print header + fsize (sem file bytes)
+    printf("\"\n");
+    printf("Debug: Tamanho do comando: %zu bytes\n", req_len + fslen);
+    printf("Debug: Tamanho do ficheiro: %zu bytes\n", fsize);
+    printf("Debug: Payload total: %zu bytes\n", payload_len);
 
     /* send binary payload */
     char *response = malloc(1024);
@@ -464,7 +501,7 @@ int cmd_create(char *request, struct addrinfo *res) {
         fprintf(stderr, "Invalid arguments!\n");
         free(response); free(fdata); free(payload);
         return 1;
-    } else if(strcmp(status, "NGL") == 0) {
+    } else if(strcmp(status, "NLG") == 0) {
         printf("User not logged in.\n");
     } else if(strcmp(status, "NOK") == 0) {
         printf("Event could not be created.\n");
@@ -556,7 +593,7 @@ int cmd_myevents(char *request, int fd_udp, struct addrinfo *res) {
     char res_cmd[4];
     char status[8];
 
-    if(send_udp_request(request, fd_udp, res, response) == 1) {
+    if(send_udp_request(request, fd_udp, res, response, sizeof(response)) == 1) {
         fprintf(stderr, "Error while communicating with server! Ending session.\n");
         return 1;
     }
@@ -637,25 +674,40 @@ int cmd_list(char *request, struct addrinfo *res) {
         return 1;
     }
 
+    printf("DEBUG: Full list response: '%s'\n", response);
+
     if(strcmp(status, "OK") == 0) {
         /* print list payload after the two tokens */
         char *payload = strchr(response, ' ');
         if (payload != NULL) {
             payload = strchr(payload + 1, ' ');
             if (payload != NULL) {
-                    /* payload contains space-separated records: EID name state event_date
-                       parse repeatedly using sscanf with %n to advance the pointer. */
-                    char *p = payload + 1;
-                    char eid[8], name[64], date[16];
-                    int state; int consumed = 0;
-                    while (*p) {
-                        if (sscanf(p, " %7s %63s %d %15s %n", eid, name, &state, date, &consumed) == 4 && consumed > 0) {
-                            printf("%s %s %d %s\n", eid, name, state, date);
-                            p += consumed;
-                        } else {
-                            break;
-                        }
-                    }
+                /* payload contains space-separated records: EID name state event_date
+                   Manual parsing because event_date contains space (16 chars: dd-mm-yyyy hh:mm) */
+                char *p = payload + 1;
+                while (*p && *p != '\n') {
+                    // Skip leading spaces
+                    while (*p == ' ') p++;
+                    if (*p == '\0' || *p == '\n') break;
+                    
+                    // Read EID, name, state using sscanf with %n
+                    char eid[8], name[64];
+                    int state, n;
+                    if (sscanf(p, "%7s %63s %d%n", eid, name, &state, &n) != 3) break;
+                    p += n;
+                    
+                    // Skip space before date
+                    while (*p == ' ') p++;
+                    
+                    // Extract exactly 16 chars for event_date
+                    if (strlen(p) < 16) break;
+                    char event_date[17];
+                    strncpy(event_date, p, 16);
+                    event_date[16] = '\0';
+                    p += 16;
+                    
+                    printf("%s %s %d %s\n", eid, name, state, event_date);
+                }
             } else {
                 printf("(no events)\n");
             }
@@ -694,7 +746,7 @@ int cmd_show(char *request, struct addrinfo *res) {
     char res_cmd[4];
     char status[8];
     char name[64];
-    char date[16];
+    char date[17];  // 16 chars + null terminator for dd-mm-yyyy hh:mm
     unsigned int seats = 0;
     unsigned int reserved = 0;
     char fname[256];
@@ -718,25 +770,50 @@ int cmd_show(char *request, struct addrinfo *res) {
         return 1;
     }
 
-    if(strcmp(status, "OK") == 0) {
-        /* Parse header fields (UID, name, date, attendance, reserved, fname, fsize) */
-        unsigned int uid;
-        if(sscanf(response, "%*s %*s %u %63s %15s %u %u %255s %u",
-                &uid, name, date, &seats, &reserved, fname, &fsize) < 7) {
-            fprintf(stderr, "Invalid response from server! Ending session.\n");
-            free(response);
-            return 1;
-        }
+    printf("DEBUG: Full show response: '%s'\n", response);
 
-        /* locate file data: Fdata starts after the header */
-        char *f_data = strstr(response, fname);
-        if(f_data == NULL) {
-            fprintf(stderr, "Cannot locate file data in response! Ending session.\n");
+    if(strcmp(status, "OK") == 0) {
+        /* Response format: RSE OK UID name event_date attendance_size reserved Fname Fsize Fdata
+           event_date has 16 chars with space: dd-mm-yyyy hh:mm
+           Manual parsing required */
+        
+        char uid_str[16];
+        int n;
+        
+        // Parse: RSE OK UID name
+        if (sscanf(response, "%*s %*s %15s %63s%n", uid_str, name, &n) != 2) {
+            fprintf(stderr, "Invalid response format (1)! Ending session.\n");
             free(response);
             return 1;
         }
-        /* Move pointer past filename and space to start of file content */
-        f_data += strlen(fname) + 1; 
+        
+        char *ptr = response + n;
+        while (*ptr == ' ') ptr++;
+        
+        // Extract exactly 16 chars for event_date
+        if (strlen(ptr) < 16) {
+            fprintf(stderr, "Invalid response format (2)! Ending session.\n");
+            free(response);
+            return 1;
+        }
+        strncpy(date, ptr, 16);
+        date[16] = '\0';
+        ptr += 16;
+        
+        // Parse: attendance_size reserved fname fsize
+        if (sscanf(ptr, " %u %u %255s %u%n", &seats, &reserved, fname, &fsize, &n) != 4) {
+            fprintf(stderr, "Invalid response format (3)! Ending session.\n");
+            free(response);
+            return 1;
+        }
+        ptr += n;
+        
+        // Skip space before file data
+        while (*ptr == ' ') ptr++;
+        
+        // ptr now points to file data
+        char *f_data = ptr;
+        
         /* now f_data points to file content; write only fsize bytes */
         if(create_file(fname, f_data) == 1) {
             fprintf(stderr, "Error creating file. Ending session.\n");
@@ -842,13 +919,12 @@ int cmd_myreservations(char *request, int fd_udp, struct addrinfo *res) {
     char res_cmd[4];
     char status[8];
 
-    if(send_udp_request(request, fd_udp, res, response) == 1) {
+    if(send_udp_request(request, fd_udp, res, response, sizeof(response)) == 1) {
         fprintf(stderr, "Error while communicating with server! Ending session.\n");
         return 1;
     }
 
-    if(sscanf(response, "%3s %7s", res_cmd, status) < 2 ||
-       validate_string_spaces(response, 0) == 1) {
+    if(sscanf(response, "%3s %7s", res_cmd, status) < 2) {
         fprintf(stderr, "Invalid response from server! Ending session.\n");
         return 1;
     }
@@ -858,21 +934,57 @@ int cmd_myreservations(char *request, int fd_udp, struct addrinfo *res) {
         return 1;
     }
 
+    // DEBUG: Show full response
+    printf("DEBUG: Full response: '%s'\n", response);
+
     if(strcmp(status, "OK") == 0) {
-        /* Print reservations as lines: EID date people */
+        /* Print reservations: EID date(dd-mm-yyyy hh:mm:ss) value */
+        /* Format: RMR OK EID1 date1 value1 EID2 date2 value2 ... */
+        /* date is 19 chars with spaces, need manual parsing */
         char *payload = strchr(response, ' ');
         if (payload != NULL) payload = strchr(payload + 1, ' ');
         if (payload == NULL) {
             printf("(no reservations)\n");
         } else {
-            char *p = payload + 1;
-            char eid[8]; char date[16]; int people; int consumed = 0; int any = 0;
-            while (*p) {
-                if (sscanf(p, " %7s %15s %d %n", eid, date, &people, &consumed) == 3 && consumed > 0) {
-                    printf("%s %s %d\n", eid, date, people);
-                    p += consumed;
-                    any = 1;
-                } else break;
+            char *p = payload + 1;  // skip space after "OK "
+            int any = 0;
+            
+            // Process all reservations in the response
+            while (1) {
+                // Skip whitespace
+                while (*p == ' ') p++;
+                if (*p == '\n' || *p == '\0') break;
+                
+                // Read EID (3 digits)
+                char eid[8];
+                int n;
+                if (sscanf(p, "%7s%n", eid, &n) != 1) break;
+                p += n;
+                
+                // Skip space
+                while (*p == ' ') p++;
+                if (*p == '\0' || *p == '\n') break;
+                
+                // Read date (19 chars: dd-mm-yyyy hh:mm:ss)
+                if (strlen(p) < 19) break;
+                char date[20];
+                strncpy(date, p, 19);
+                date[19] = '\0';
+                p += 19;
+                
+                // Skip space
+                while (*p == ' ') p++;
+                if (*p == '\0' || *p == '\n') break;
+                
+                // Read value
+                int value;
+                if (sscanf(p, "%d%n", &value, &n) != 1) break;
+                p += n;
+                
+                printf("EID: %s | Date: %s | Seats: %d\n", eid, date, value);
+                any = 1;
+                
+                // Continue to next reservation (if any)
             }
             if (!any) printf("(no reservations)\n");
         }

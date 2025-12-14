@@ -8,7 +8,7 @@ void add_user_session(const char *UID, const char *password);
 void remove_user_session(const char *UID);
 
 int validate_string_spaces(const char *str, int limit);
-int send_udp_request(char *request, int fd_udp, struct addrinfo *res, char *response);
+int send_udp_request(char *request, int fd_udp, struct addrinfo *res, char *response, size_t response_cap);
 int send_tcp_request(char *request, struct addrinfo *res, char *response, size_t response_cap);
 int create_file(char *f_name, char *f_data);
 

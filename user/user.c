@@ -256,7 +256,7 @@ int interact(struct addrinfo *res_udp, struct addrinfo *res_tcp, int fd_udp) {
 
 
 int main(int argc, char *argv[]) {
-    char ESIP[INET_ADDRSTRLEN] = "";
+    char ESIP[INET_ADDRSTRLEN] = "localhost";
     char ESport[PORT_STRLEN] = DEFAULT_PORT;
     struct addrinfo *res_udp, *res_tcp;
     struct timeval timeout;

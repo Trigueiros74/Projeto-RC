@@ -3,11 +3,10 @@
 
 #include <stddef.h>
 
-#define MAX_USERS 10000
-#define MAX_EVENTS 256
-#define MAX_RESERVATIONS 1024
 #define MAX_FILENAME_LEN 24
-#define MAX_FDATA_SIZE (10 * 1024 * 1024)
+#define MAX_FDATA_SIZE (10 * 1024 * 1024)  /* 10 MB */
+#define MAX_EID 999  /* EID is 3-digit: 001-999 */
+#define MAX_MYRESERVATIONS_DISPLAY 50  /* myreservations command shows max 50 (most recent) */
 
 typedef struct {
     char uid[7];
@@ -20,7 +19,7 @@ typedef struct {
     int eid;
     char owner[7];
     char name[11];
-    char event_date[11];
+    char event_date[17];  /* dd-mm-yyyy hh:mm */
     int attendance_size;
     int seats_reserved;
     char fname[MAX_FILENAME_LEN+1];
@@ -34,6 +33,7 @@ typedef struct {
     char uid[7];
     int eid;
     int people;
+    char timestamp[20];  /* dd-mm-yyyy hh:mm:ss */
     int used;
 } Reservation;
 
@@ -57,6 +57,8 @@ int cmd_cps(char **response_buf, size_t *response_len, const char *uid, const ch
 
 /* lifecycle helpers */
 int commands_init(void);
+int init_persistence(void);  /* Initialize file-based persistence system */
+
 void commands_cleanup(void);
 
 #endif

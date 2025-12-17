@@ -1,0 +1,45 @@
+<pre><center><font size="10" color="blue"> --------- TEST RESULTS --------- </font></center><br><br><center><font size="5" color="blue"> SCRIPT: 4 (request from 109.49.107.111) </font></center><br><br>Report finalization date: Wed, 17 Dec 2025 18:37:11 GMT<br><br><br><br><center><font size="5" color="blue"> ============= USER REPORT ============ </font></center><br><br><br>------------------------------------------------------------
+Target server addr: 193.136.128.104 and port: 58068
+------------------------------------------------------------
+Working dir 1518072/ created
+
+Command file: script_04.txt
+
+========== ========== ========== ========== ========== ========== ==========
+at Wed, 17 Dec 2025 18:37:08 GMT
+User > login 111111 abababab
+
+New user registered - Login successful (RLI REG)
+========== ========== ========== ========== ========== ========== ==========
+at Wed, 17 Dec 2025 18:37:08 GMT
+User [111111]> changePass abababab babababa
+
+Error reading from TCP socket.
+========== ========== ========== ========== ========== ========== ==========
+at Wed, 17 Dec 2025 18:37:11 GMT
+User [111111]> logout
+
+<font size="3" color="red">FORMAT ERROR:                              Unexpected server response to LOU
+<font size="3" color="black">========== ========== ========== ========== ========== ========== ==========
+at Wed, 17 Dec 2025 18:37:11 GMT
+User [111111]> login 111111 abababab
+
+A user is logged in
+========== ========== ========== ========== ========== ========== ==========
+at Wed, 17 Dec 2025 18:37:11 GMT
+User [111111]> login 111111 babababa
+
+A user is logged in
+========== ========== ========== ========== ========== ========== ==========
+at Wed, 17 Dec 2025 18:37:11 GMT
+User [111111]> logout
+
+<font size="3" color="red">FORMAT ERROR:                              Unexpected server response to LOU
+<font size="3" color="black">========== ========== ========== ========== ========== ========== ==========
+at Wed, 17 Dec 2025 18:37:11 GMT
+User [111111]> exit
+
+Logout user 111111
+<font size="3" color="red">FORMAT ERROR:                              Unexpected server response to LOU
+<font size="3" color="black">===== ========== ========== ==========END========== ========== ========== =====
+</pre><br><br>

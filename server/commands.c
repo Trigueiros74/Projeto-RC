@@ -1131,6 +1131,14 @@ int cmd_cps(char **response_buf, size_t *response_len, const char *uid, const ch
         return 0;
     }
     strncpy(u->password, newpass, sizeof(u->password)-1);
+    
+    /* Save new password to disk */
+    if (save_user_password(uid, newpass) == -1) {
+        *response_buf = strdup("RCP NOK\n");
+        *response_len = strlen(*response_buf);
+        return 0;
+    }
+    
     *response_buf = strdup("RCP OK\n");
     *response_len = strlen(*response_buf);
     return 0;

@@ -22,54 +22,43 @@ extern int errno;
 #define DEFAULT_PORT "58068"
 #define PORT_STRLEN 6
 
-/* Helper: read all data from a connected TCP socket until EOF.
-   Returns pointer to allocated buffer and sets out_len. Caller must free.
-   On error returns NULL and out_len = 0.
-   NOTE: this reads until peer closes connection (typical for the simple
-   request/response clients used by the project). If you prefer a different
-   framing (read until newline and then handle file sizes separately),
-   that logic can be swapped in. */
-static char *read_all_from_fd(int fd, size_t *out_len) {
-    const size_t CHUNK = 8192;
-    char tmp[8192];
-    char *buf = NULL;
-    size_t cap = 0;
-    size_t len = 0;
-    ssize_t r;
-
-    while ((r = read(fd, tmp, CHUNK)) > 0) {
-        if (len + (size_t)r + 1 > cap) {
-            size_t newcap = (cap == 0) ? (len + r + 1) : (cap * 2);
-            if (newcap < len + (size_t)r + 1) newcap = len + r + 1;
-            char *nb = realloc(buf, newcap);
-            if (!nb) {
-                free(buf);
-                return NULL;
-            }
-            buf = nb;
-            cap = newcap;
+/* Helper: read exactly 'size' bytes from fd into buf.
+   Returns 1 on success, 0 on error.
+   Based on robust reading pattern from reference implementation. */
+static int read_exact(int fd, char *buf, size_t size) {
+    ssize_t nread;
+    char *ptr = buf;
+    while (size > 0) {
+        nread = read(fd, ptr, size);
+        if (nread == -1) {
+            if (errno == EINTR) continue; /* interrupted, retry */
+            return 0; /* error */
         }
-        memcpy(buf + len, tmp, r);
-        len += r;
+        if (nread == 0) {
+            return 0; /* premature EOF */
+        }
+        size -= (size_t)nread;
+        ptr += nread;
     }
+    return 1;
+}
 
-    if (r < 0) {
-        free(buf);
-        return NULL;
+/* Helper: write exactly 'size' bytes from buf to fd.
+   Returns 1 on success, 0 on error.
+   Based on robust writing pattern from reference implementation. */
+static int write_exact(int fd, const char *buf, size_t size) {
+    ssize_t nwritten;
+    const char *ptr = buf;
+    while (size > 0) {
+        nwritten = write(fd, ptr, size);
+        if (nwritten == -1) {
+            if (errno == EINTR) continue; /* interrupted, retry */
+            return 0; /* error */
+        }
+        size -= (size_t)nwritten;
+        ptr += nwritten;
     }
-
-    if (!buf) {
-        /* empty request */
-        buf = malloc(1);
-        if (!buf) return NULL;
-        buf[0] = '\0';
-        len = 0;
-    } else {
-        buf[len] = '\0';
-    }
-
-    *out_len = len;
-    return buf;
+    return 1;
 }
 
 
@@ -243,25 +232,166 @@ int server_udp(int fd_udp, int verbose) {
 int server_tcp(int fd_tcp, int verbose) {
     char command[8];
     int invalid_req = 0;
+    
+    /* Read initial part to identify command - read up to first space or newline */
+    char cmd_buf[8];
+    size_t cmd_len = 0;
+    while (cmd_len < sizeof(cmd_buf) - 1) {
+        char c;
+        ssize_t r = read(fd_tcp, &c, 1);
+        if (r == -1) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "Error reading from TCP client\n");
+            return 1;
+        }
+        if (r == 0 || c == ' ' || c == '\n') {
+            break;
+        }
+        cmd_buf[cmd_len++] = c;
+    }
+    cmd_buf[cmd_len] = '\0';
+    
+    if (cmd_len == 0) {
+        invalid_req = 2;
+        char *err_response = "ERR\n";
+        write_exact(fd_tcp, err_response, strlen(err_response));
+        return 0;
+    }
+    
+    strncpy(command, cmd_buf, sizeof(command) - 1);
+    command[sizeof(command) - 1] = '\0';
+    
+    /* Now read the rest based on command type */
+    char *request = NULL;
     size_t req_len = 0;
-    char *request = read_all_from_fd(fd_tcp, &req_len);
-    if(request == NULL) {
-        fprintf(stderr, "Error reading from TCP client\n");
-        return 1;
+    
+    /* For most commands, read until newline. For CRE, need special handling */
+    if (strcmp(command, "CRE") == 0) {
+        /* CRE format: CRE UID password name event_date attendance_size Fname Fsize <Fdata>
+           Read rest of line first, then read Fdata based on Fsize */
+        const size_t MAX_LINE = 8192;
+        char *line_buf = malloc(MAX_LINE);
+        if (!line_buf) {
+            fprintf(stderr, "Memory allocation error\n");
+            return 1;
+        }
+        
+        /* Copy "CRE " to start of buffer */
+        strcpy(line_buf, command);
+        strcat(line_buf, " ");
+        size_t line_len = strlen(line_buf);
+        
+        /* Read until we have all metadata (up to and including Fsize) */
+        /* This is tricky - we need to parse as we go to find Fsize, then read Fdata */
+        /* Simpler approach: read until space after a number that should be Fsize */
+        int space_count = 0;
+        while (line_len < MAX_LINE - 1) {
+            char c;
+            ssize_t r = read(fd_tcp, &c, 1);
+            if (r == -1) {
+                if (errno == EINTR) continue;
+                free(line_buf);
+                fprintf(stderr, "Error reading from TCP client\n");
+                return 1;
+            }
+            if (r == 0) break;
+            
+            line_buf[line_len++] = c;
+            
+            /* Count spaces to know when we've read enough metadata
+               Format: CRE UID password name event_date attendance_size Fname Fsize */
+            if (c == ' ') space_count++;
+            
+            /* After 7th space we have Fsize, read it */
+            if (space_count == 7) {
+                /* Next chars should be Fsize number, followed by space */
+                int fsize = 0;
+                char fsize_buf[16];
+                int fsize_idx = 0;
+                
+                while (fsize_idx < 15) {
+                    r = read(fd_tcp, &c, 1);
+                    if (r <= 0) break;
+                    line_buf[line_len++] = c;
+                    
+                    if (c == ' ') {
+                        fsize_buf[fsize_idx] = '\0';
+                        fsize = atoi(fsize_buf);
+                        break;
+                    }
+                    fsize_buf[fsize_idx++] = c;
+                }
+                
+                /* Now read fsize bytes of file data */
+                if (fsize > 0) {
+                    size_t total_needed = line_len + fsize;
+                    char *new_buf = realloc(line_buf, total_needed + 1);
+                    if (!new_buf) {
+                        free(line_buf);
+                        fprintf(stderr, "Memory allocation error\n");
+                        return 1;
+                    }
+                    line_buf = new_buf;
+                    
+                    if (!read_exact(fd_tcp, line_buf + line_len, fsize)) {
+                        free(line_buf);
+                        fprintf(stderr, "Error reading file data from TCP client\n");
+                        return 1;
+                    }
+                    line_len += fsize;
+                }
+                break;
+            }
+        }
+        
+        line_buf[line_len] = '\0';
+        request = line_buf;
+        req_len = line_len;
+        
+    } else {
+        /* For other commands, read until newline */
+        const size_t MAX_LINE = 8192;
+        char *line_buf = malloc(MAX_LINE);
+        if (!line_buf) {
+            fprintf(stderr, "Memory allocation error\n");
+            return 1;
+        }
+        
+        strcpy(line_buf, command);
+        strcat(line_buf, " ");
+        size_t line_len = strlen(line_buf);
+        
+        while (line_len < MAX_LINE - 1) {
+            char c;
+            ssize_t r = read(fd_tcp, &c, 1);
+            if (r == -1) {
+                if (errno == EINTR) continue;
+                free(line_buf);
+                fprintf(stderr, "Error reading from TCP client\n");
+                return 1;
+            }
+            if (r == 0) break;
+            
+            line_buf[line_len++] = c;
+            if (c == '\n') break;
+        }
+        
+        line_buf[line_len] = '\0';
+        request = line_buf;
+        req_len = line_len;
     }
 
-    /* Debug: print full TCP message (as a string) */
+    /* Debug: print TCP message info */
     if (verbose) {
         printf("----- TCP MESSAGE (%zu bytes) -----\n", req_len);
-        printf("%s", request);
-        if (req_len == 0 || request[req_len - 1] != '\n') putchar('\n');
+        /* For CRE, only print non-binary part */
+        if (strcmp(command, "CRE") == 0) {
+            printf("CRE command with file data (%zu total bytes)\n", req_len);
+        } else {
+            printf("%s", request);
+            if (req_len == 0 || request[req_len - 1] != '\n') putchar('\n');
+        }
         printf("----- END TCP MESSAGE -----\n");
-    }
-
-    /* show client info when possible (getsockname not used; caller logs on accept) */
-    if(sscanf(request, "%7s", command) != 1) {
-        invalid_req = 2;
-        /* Prepare an ERR response to be sent via TCP below */
     }
 
     char *response_buf = NULL;
@@ -483,19 +613,14 @@ int server_tcp(int fd_tcp, int verbose) {
         }
     }
 
-    /* write full response_buf to TCP client (handle partial writes) */
-    ssize_t bytes_left = (ssize_t)response_len;
-    ssize_t total_written = 0;
-    while(bytes_left > 0) {
-        ssize_t w = write(fd_tcp, response_buf + total_written, bytes_left);
-        if(w < 0) {
+    /* write full response_buf to TCP client using robust write */
+    if (response_buf && response_len > 0) {
+        if (!write_exact(fd_tcp, response_buf, response_len)) {
             fprintf(stderr, "Error writing to TCP client: %s\n", strerror(errno));
             free(request);
             free(response_buf);
             return 1;
         }
-        bytes_left -= w;
-        total_written += w;
     }
 
     free(request);

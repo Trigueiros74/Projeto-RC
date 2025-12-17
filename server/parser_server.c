@@ -315,6 +315,11 @@ int parse_rid(char *buffer, char *uid, char *password, char *eid, int *people) {
 
 /* CPS UID oldPassword newPassword\n */
 int parse_cps(char *buffer, char *uid, char *oldpass, char *newpass) {
+
+
+
+    // USAR 7 - 9 - 9 variáveis estaticas
+
     char extra[2];
     if (sscanf(buffer, "%*s %6s %127s %127s %1s", uid, oldpass, newpass, extra) != 3)
         return 1;

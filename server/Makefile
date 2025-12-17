@@ -3,6 +3,7 @@ CFLAGS = -Wall -g
 TARGET = ES
 SRCS = ES.c parser_server.c commands.c
 OBJS = $(SRCS:.c=.o)
+ESDIR = ESDIR
 
 all: $(TARGET)
 
@@ -14,6 +15,6 @@ $(TARGET): $(OBJS)
 
 clean:
 	rm -f $(TARGET) $(OBJS)
+	rm -rf $(ESDIR)
 
 .PHONY: all clean
-

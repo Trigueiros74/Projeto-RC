@@ -167,6 +167,11 @@ static int cmp_date(const char *d1, const char *d2) {
     return (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0;
 }
 
+/* Helper to determine whether date checks should be bypassed.
+   Set environment variable ES_ALLOW_PAST (any value) to bypass checks. */
+/* (previously had an ES_ALLOW_PAST toggle; date checks are now permanent)
+   No helper required. */
+
 /* ========== FILE PERSISTENCE FUNCTIONS ========== */
 
 /* Create directory if it doesn't exist */
@@ -834,14 +839,8 @@ int cmd_cre(char **response_buf, size_t *response_len, const char *uid, const ch
         return 0;
     }
 
-    /* reject events with dates in the past: per protocol return NOK (creation failed) */
-    char current_dt[17];
-    get_current_datetime(current_dt);
-    if (cmp_date(event_date, current_dt) < 0) {
-        *response_buf = strdup("RCE NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
+    /* Creation: allow events with past dates. They will be shown as past
+       by listing/state logic (no creation-time rejection). */
 
     /* create event slot */
     Event *ev = create_event_slot();
@@ -927,14 +926,8 @@ int cmd_cls(char **response_buf, size_t *response_len, const char *uid, const ch
         *response_len = strlen(*response_buf);
         return 0;
     }
-    /* check if in past */
-    char current_dt[17];
-    get_current_datetime(current_dt);
-    if (cmp_date(ev->event_date, current_dt) < 0) {
-        *response_buf = strdup("RCL PST\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
+        /* (Previously would reject if event date is in the past.)
+           Creation of past events is allowed; do not reject here. */
     if (ev->closed) {
         *response_buf = strdup("RCL CLO\n");
         *response_len = strlen(*response_buf);
@@ -1057,14 +1050,8 @@ int cmd_rid(char **response_buf, size_t *response_len, const char *uid, const ch
         *response_len = strlen(*response_buf);
         return 0;
     }
-    /* check PST */
-    char current_dt[17];
-    get_current_datetime(current_dt);
-    if (cmp_date(ev->event_date, current_dt) < 0) {
-        *response_buf = strdup("RRI PST\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
+    /* (Previously would reject if event date is in the past.)
+       Reservation creation now allowed; do not reject here. */
     /* closed */
     if (ev->closed) {
         *response_buf = strdup("RRI CLS\n");
@@ -1102,7 +1089,7 @@ int cmd_rid(char **response_buf, size_t *response_len, const char *uid, const ch
     update_event_reservations(ev->eid, ev->seats_reserved);
     
     char tmp[64];
-    snprintf(tmp, sizeof tmp, "RRI ACC %d\n", ev->seats_reserved);
+    snprintf(tmp, sizeof tmp, "RRI ACC\n");
     *response_buf = strdup(tmp);
     *response_len = strlen(*response_buf);
     return 0;

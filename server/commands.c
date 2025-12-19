@@ -17,8 +17,15 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 
 #include "commands.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#define UDP_RESPONSE_MAX 2048
 
 /* Base directory for persistent storage */
 #define BASE_DIR "ESDIR"
@@ -51,19 +58,27 @@ static int next_eid = 1;
 /* Get current timestamp in dd-mm-yyyy hh:mm:ss format */
 static void get_current_timestamp(char *out) {
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    snprintf(out, 20, "%02d-%02d-%04d %02d:%02d:%02d",
-             t->tm_mday, t->tm_mon + 1, t->tm_year + 1900,
-             t->tm_hour, t->tm_min, t->tm_sec);
+    struct tm t;
+    if (!out) return;
+    if (localtime_r(&now, &t) == NULL) {
+        out[0] = '\0';
+        return;
+    }
+    /* 19 chars + NUL */
+    (void)strftime(out, 20, "%d-%m-%Y %H:%M:%S", &t);
 }
 
 /* Get current date+time in dd-mm-yyyy hh:mm format (for event date comparisons) */
 static void get_current_datetime(char *out) {
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    snprintf(out, 17, "%02d-%02d-%04d %02d:%02d",
-             t->tm_mday, t->tm_mon + 1, t->tm_year + 1900,
-             t->tm_hour, t->tm_min);
+    struct tm t;
+    if (!out) return;
+    if (localtime_r(&now, &t) == NULL) {
+        out[0] = '\0';
+        return;
+    }
+    /* 16 chars + NUL */
+    (void)strftime(out, 17, "%d-%m-%Y %H:%M", &t);
 }
 
 /* Find user by UID */
@@ -195,21 +210,21 @@ static int init_storage(void) {
 
 /* Save user password */
 static int save_user_password(const char *uid, const char *password) {
-    char user_dir[512];
-    char pass_file[512];
-    char created_dir[512];
-    char reserved_dir[512];
+    char user_dir[PATH_MAX];
+    char pass_file[PATH_MAX];
+    char created_dir[PATH_MAX];
+    char reserved_dir[PATH_MAX];
     
-    snprintf(user_dir, sizeof user_dir, "%s/%s", USERS_DIR, uid);
+    snprintf(user_dir, sizeof user_dir, "%s/%.6s", USERS_DIR, uid);
     if (ensure_dir(user_dir) == -1) return -1;
     
     /* Create CREATED and RESERVED subdirectories */
-    snprintf(created_dir, sizeof created_dir, "%s/CREATED", user_dir);
-    snprintf(reserved_dir, sizeof reserved_dir, "%s/RESERVED", user_dir);
+    snprintf(created_dir, sizeof created_dir, "%s/%.6s/CREATED", USERS_DIR, uid);
+    snprintf(reserved_dir, sizeof reserved_dir, "%s/%.6s/RESERVED", USERS_DIR, uid);
     ensure_dir(created_dir);
     ensure_dir(reserved_dir);
     
-    snprintf(pass_file, sizeof pass_file, "%s/%s_pass.txt", user_dir, uid);
+    snprintf(pass_file, sizeof pass_file, "%s/%.6s/%.6s_pass.txt", USERS_DIR, uid, uid);
     FILE *f = fopen(pass_file, "w");
     if (!f) return -1;
     fprintf(f, "%s\n", password);
@@ -219,8 +234,8 @@ static int save_user_password(const char *uid, const char *password) {
 
 /* Load user password */
 static int load_user_password(const char *uid, char *password, size_t max_len) {
-    char pass_file[512];
-    snprintf(pass_file, sizeof pass_file, "%s/%s/%s_pass.txt", USERS_DIR, uid, uid);
+    char pass_file[PATH_MAX];
+    snprintf(pass_file, sizeof pass_file, "%s/%.6s/%.6s_pass.txt", USERS_DIR, uid, uid);
     
     FILE *f = fopen(pass_file, "r");
     if (!f) return -1;
@@ -240,8 +255,8 @@ static int load_user_password(const char *uid, char *password, size_t max_len) {
 
 /* Create login marker */
 static int mark_user_logged_in(const char *uid) {
-    char login_file[512];
-    snprintf(login_file, sizeof login_file, "%s/%s/%s_login.txt", USERS_DIR, uid, uid);
+    char login_file[PATH_MAX];
+    snprintf(login_file, sizeof login_file, "%s/%.6s/%.6s_login.txt", USERS_DIR, uid, uid);
     
     FILE *f = fopen(login_file, "w");
     if (!f) return -1;
@@ -252,20 +267,20 @@ static int mark_user_logged_in(const char *uid) {
 
 /* Remove login marker */
 static int mark_user_logged_out(const char *uid) {
-    char login_file[512];
-    snprintf(login_file, sizeof login_file, "%s/%s/%s_login.txt", USERS_DIR, uid, uid);
+    char login_file[PATH_MAX];
+    snprintf(login_file, sizeof login_file, "%s/%.6s/%.6s_login.txt", USERS_DIR, uid, uid);
     unlink(login_file);  /* Remove file */
     return 0;
 }
 
 /* Delete user password (for unregister) */
 static int delete_user_password(const char *uid) {
-    char pass_file[512];
-    snprintf(pass_file, sizeof pass_file, "%s/%s/%s_pass.txt", USERS_DIR, uid, uid);
+    char pass_file[PATH_MAX];
+    snprintf(pass_file, sizeof pass_file, "%s/%.6s/%.6s_pass.txt", USERS_DIR, uid, uid);
     unlink(pass_file);
     
-    char login_file[512];
-    snprintf(login_file, sizeof login_file, "%s/%s/%s_login.txt", USERS_DIR, uid, uid);
+    char login_file[PATH_MAX];
+    snprintf(login_file, sizeof login_file, "%s/%.6s/%.6s_login.txt", USERS_DIR, uid, uid);
     unlink(login_file);
     
     return 0;
@@ -273,34 +288,37 @@ static int delete_user_password(const char *uid) {
 
 /* Save event to START file */
 static int save_event_start(const Event *ev) {
-    char event_dir[512];
-    char start_file[512];
-    char desc_dir[512];
-    char desc_file[512];
-    char res_file[512];
+    char event_dir[PATH_MAX];
+    char start_file[PATH_MAX];
+    char desc_dir[PATH_MAX];
+    char desc_file[PATH_MAX];
+    char res_file[PATH_MAX];
+    char res_dir[PATH_MAX];
+    char user_created[PATH_MAX];
+    char created_file[PATH_MAX];
     
     snprintf(event_dir, sizeof event_dir, "%s/%03d", EVENTS_DIR, ev->eid);
     if (ensure_dir(event_dir) == -1) return -1;
     
     /* Save START file */
-    snprintf(start_file, sizeof start_file, "%s/START_%03d.txt", event_dir, ev->eid);
+    snprintf(start_file, sizeof start_file, "%s/%03d/START_%03d.txt", EVENTS_DIR, ev->eid, ev->eid);
     FILE *f = fopen(start_file, "w");
     if (!f) return -1;
     fprintf(f, "%s %s %s %d %s\n", ev->owner, ev->name, ev->fname, ev->attendance_size, ev->event_date);
     fclose(f);
     
     /* Save RES file (initially 0) */
-    snprintf(res_file, sizeof res_file, "%s/RES_%03d.txt", event_dir, ev->eid);
+    snprintf(res_file, sizeof res_file, "%s/%03d/RES_%03d.txt", EVENTS_DIR, ev->eid, ev->eid);
     f = fopen(res_file, "w");
     if (!f) return -1;
     fprintf(f, "%d\n", ev->seats_reserved);
     fclose(f);
     
     /* Create DESCRIPTION dir and save file */
-    snprintf(desc_dir, sizeof desc_dir, "%s/DESCRIPTION", event_dir);
+    snprintf(desc_dir, sizeof desc_dir, "%s/%03d/DESCRIPTION", EVENTS_DIR, ev->eid);
     if (ensure_dir(desc_dir) == -1) return -1;
     
-    snprintf(desc_file, sizeof desc_file, "%s/%s", desc_dir, ev->fname);
+    snprintf(desc_file, sizeof desc_file, "%s/%03d/DESCRIPTION/%.24s", EVENTS_DIR, ev->eid, ev->fname);
     f = fopen(desc_file, "wb");
     if (!f) return -1;
     if (ev->fsize > 0 && ev->fdata) {
@@ -309,16 +327,13 @@ static int save_event_start(const Event *ev) {
     fclose(f);
     
     /* Create RESERVATIONS dir */
-    char res_dir[512];
-    snprintf(res_dir, sizeof res_dir, "%s/RESERVATIONS", event_dir);
+    snprintf(res_dir, sizeof res_dir, "%s/%03d/RESERVATIONS", EVENTS_DIR, ev->eid);
     ensure_dir(res_dir);
     
     /* Add to user's CREATED dir */
-    char user_created[512];
-    char created_file[512];
-    snprintf(user_created, sizeof user_created, "%s/%s/CREATED", USERS_DIR, ev->owner);
+    snprintf(user_created, sizeof user_created, "%s/%.6s/CREATED", USERS_DIR, ev->owner);
     ensure_dir(user_created);
-    snprintf(created_file, sizeof created_file, "%s/%03d.txt", user_created, ev->eid);
+    snprintf(created_file, sizeof created_file, "%s/%.6s/CREATED/%03d.txt", USERS_DIR, ev->owner, ev->eid);
     f = fopen(created_file, "w");
     if (f) {
         fprintf(f, "%03d\n", ev->eid);
@@ -330,7 +345,7 @@ static int save_event_start(const Event *ev) {
 
 /* Update RES file */
 static int update_event_reservations(int eid, int total_reserved) {
-    char res_file[512];
+    char res_file[PATH_MAX];
     snprintf(res_file, sizeof res_file, "%s/%03d/RES_%03d.txt", EVENTS_DIR, eid, eid);
     
     FILE *f = fopen(res_file, "w");
@@ -361,7 +376,7 @@ static int save_reservation(const Reservation *r) {
              r->uid, yyyy, mm, dd, hh, min, ss);
     
     /* Save to event RESERVATIONS dir */
-    char event_res_file[512];
+    char event_res_file[PATH_MAX];
     snprintf(event_res_file, sizeof event_res_file, "%s/%03d/RESERVATIONS/%s",
              EVENTS_DIR, r->eid, timestamp_file);
     
@@ -371,12 +386,12 @@ static int save_reservation(const Reservation *r) {
     fclose(f);
     
     /* Save to user RESERVED dir */
-    char user_reserved_dir[512];
-    char user_res_file[512];
-    snprintf(user_reserved_dir, sizeof user_reserved_dir, "%s/%s/RESERVED", USERS_DIR, r->uid);
+    char user_reserved_dir[PATH_MAX];
+    char user_res_file[PATH_MAX];
+    snprintf(user_reserved_dir, sizeof user_reserved_dir, "%s/%.6s/RESERVED", USERS_DIR, r->uid);
     ensure_dir(user_reserved_dir);
     
-    snprintf(user_res_file, sizeof user_res_file, "%s/%s", user_reserved_dir, timestamp_file);
+    snprintf(user_res_file, sizeof user_res_file, "%s/%.6s/RESERVED/%s", USERS_DIR, r->uid, timestamp_file);
     f = fopen(user_res_file, "w");
     if (!f) return 0;  /* Not critical if user copy fails */
     fprintf(f, "%s %d %s\n", r->uid, r->people, r->timestamp);
@@ -387,7 +402,7 @@ static int save_reservation(const Reservation *r) {
 
 /* Close event (create END file) */
 static int close_event_file(int eid) {
-    char end_file[512];
+    char end_file[PATH_MAX];
     char timestamp[20];
     
     get_current_timestamp(timestamp);
@@ -413,7 +428,7 @@ static int load_events_from_disk(void) {
         if (eid <= 0 || eid > 999) continue;
         
         /* Read START file */
-        char start_file[512];
+        char start_file[PATH_MAX];
         snprintf(start_file, sizeof start_file, "%s/%03d/START_%03d.txt", EVENTS_DIR, eid, eid);
         
         FILE *f = fopen(start_file, "r");
@@ -437,7 +452,7 @@ static int load_events_from_disk(void) {
         fclose(f);
         
         /* Read RES file */
-        char res_file[512];
+        char res_file[PATH_MAX];
         snprintf(res_file, sizeof res_file, "%s/%03d/RES_%03d.txt", EVENTS_DIR, eid, eid);
         f = fopen(res_file, "r");
         if (f) {
@@ -446,12 +461,12 @@ static int load_events_from_disk(void) {
         }
         
         /* Check if closed */
-        char end_file[512];
+        char end_file[PATH_MAX];
         snprintf(end_file, sizeof end_file, "%s/%03d/END_%03d.txt", EVENTS_DIR, eid, eid);
         ev->closed = (access(end_file, F_OK) == 0) ? 1 : 0;
         
         /* Load file data */
-        char desc_file[512];
+        char desc_file[PATH_MAX];
         snprintf(desc_file, sizeof desc_file, "%s/%03d/DESCRIPTION/%s", EVENTS_DIR, eid, ev->fname);
         f = fopen(desc_file, "rb");
         if (f) {
@@ -485,8 +500,8 @@ static int load_users_from_disk(void) {
         const char *uid = entry->d_name;
         
         /* Check if password file exists */
-        char pass_file[512];
-        snprintf(pass_file, sizeof pass_file, "%s/%s/%s_pass.txt", USERS_DIR, uid, uid);
+        char pass_file[PATH_MAX];
+        snprintf(pass_file, sizeof pass_file, "%s/%.6s/%.6s_pass.txt", USERS_DIR, uid, uid);
         
         FILE *f = fopen(pass_file, "r");
         if (!f) continue;  /* User unregistered */
@@ -520,8 +535,8 @@ static int load_users_from_disk(void) {
             }
             
             /* Check if logged in (login file exists) */
-            char login_file[512];
-            snprintf(login_file, sizeof login_file, "%s/%s/%s_login.txt", USERS_DIR, uid, uid);
+            char login_file[PATH_MAX];
+            snprintf(login_file, sizeof login_file, "%s/%.6s/%.6s_login.txt", USERS_DIR, uid, uid);
             u->logged_in = (access(login_file, F_OK) == 0) ? 1 : 0;
         }
         
@@ -687,7 +702,7 @@ int cmd_lme(char *response, const char *uid, const char *password) {
         return 0;
     }
     /* collect events owned by this user */
-    char tmp[2048];
+    char tmp[UDP_RESPONSE_MAX];
     tmp[0] = '\0';
     int count = 0;
     
@@ -716,7 +731,21 @@ int cmd_lme(char *response, const char *uid, const char *password) {
         sprintf(response, "RME NOK\n");
         return 0;
     }
-    snprintf(response, 2048, "RME OK%s\n", tmp);
+    /* Compose response safely within UDP_RESPONSE_MAX */
+    size_t used = (size_t)snprintf(response, UDP_RESPONSE_MAX, "RME OK");
+    if (used >= UDP_RESPONSE_MAX) {
+        response[UDP_RESPONSE_MAX - 1] = '\0';
+        return 0;
+    }
+    size_t tmp_len = strlen(tmp);
+    size_t avail = (UDP_RESPONSE_MAX - 1) - used; /* leave room for NUL */
+    if (tmp_len > avail) tmp_len = avail;
+    memcpy(response + used, tmp, tmp_len);
+    used += tmp_len;
+    if (used < UDP_RESPONSE_MAX - 1) {
+        response[used++] = '\n';
+    }
+    response[used] = '\0';
     return 0;
 }
 
@@ -794,17 +823,30 @@ int cmd_lmr(char *response, const char *uid, const char *password) {
     /* Take last 50 reservations maximum (most recent) */
     int start_idx = (res_count > MAX_MYRESERVATIONS_DISPLAY) ? (res_count - MAX_MYRESERVATIONS_DISPLAY) : 0;
     
-    char tmp[4096];
-    tmp[0] = '\0';
-    for (int i = start_idx; i < res_count; ++i) {
-        char part[128];
-        snprintf(part, sizeof part, " %03d %s %d", 
-                 res_list[i].eid, res_list[i].timestamp, res_list[i].people);
-        strncat(tmp, part, sizeof tmp - strlen(tmp) - 1);
+    /* Build reply directly into the provided UDP response buffer (which is 2048 bytes). */
+    size_t used = (size_t)snprintf(response, UDP_RESPONSE_MAX, "RMR OK");
+    if (used >= UDP_RESPONSE_MAX) {
+        response[UDP_RESPONSE_MAX - 1] = '\0';
+        free(res_list);
+        return 0;
     }
-    
-    snprintf(response, 4096, "RMR OK%s\n", tmp);
-    free(res_list);  /* Don't forget to free */
+    for (int i = start_idx; i < res_count; ++i) {
+        size_t remain = UDP_RESPONSE_MAX - used;
+        if (remain <= 2) break; /* keep space for at least '\n' + '\0' */
+        int w = snprintf(response + used, remain, " %03d %s %d",
+                         res_list[i].eid, res_list[i].timestamp, res_list[i].people);
+        if (w < 0) break;
+        if ((size_t)w >= remain) {
+            /* truncated: stop appending */
+            used = UDP_RESPONSE_MAX - 1;
+            response[used] = '\0';
+            break;
+        }
+        used += (size_t)w;
+    }
+    if (used < UDP_RESPONSE_MAX - 1) response[used++] = '\n';
+    response[used] = '\0';
+    free(res_list);
     return 0;
 }
 
@@ -839,9 +881,16 @@ int cmd_cre(char **response_buf, size_t *response_len, const char *uid, const ch
         return 0;
     }
 
-    /* Creation: allow events with past dates. They will be shown as past
-       by listing/state logic (no creation-time rejection). */
-
+    /* Reject creation of events scheduled before current date/time. */
+    
+    char current_dt[17];
+    get_current_datetime(current_dt);
+    if (cmp_date(event_date, current_dt) < 0) {
+        *response_buf = strdup("RCE NOK\n");
+        *response_len = strlen(*response_buf);
+        return 0;
+    }
+    
     /* create event slot */
     Event *ev = create_event_slot();
     if (!ev) {
@@ -947,44 +996,65 @@ int cmd_cls(char **response_buf, size_t *response_len, const char *uid, const ch
 */
 int cmd_lst(char **response_buf, size_t *response_len) {
     if (!response_buf || !response_len) return 1;
-    char tmp[8192];
-    tmp[0] = '\0';
+
+    Event *event_array[1024];
     int count = 0;
-    
+
+    /* Collect events */
     EventNode *curr = events_head;
     while (curr) {
-        if (!curr->data.used) {
-            curr = curr->next;
-            continue;
+        if (curr->data.used) {
+            event_array[count++] = &curr->data;
         }
-        
-        int state;
-        char current_dt[17];
-        get_current_datetime(current_dt);
-        if (curr->data.closed) state = 3;
-        else if (curr->data.seats_reserved >= curr->data.attendance_size) state = 2;
-        else if (cmp_date(curr->data.event_date, current_dt) < 0) state = 0;
-        else state = 1;
-        
-        char part[128];
-        snprintf(part, sizeof part, " %03d %s %d %s", curr->data.eid, curr->data.name, state, curr->data.event_date);
-        strncat(tmp, part, sizeof tmp - strlen(tmp) - 1);
-        count++;
         curr = curr->next;
     }
-    
+
     if (count == 0) {
         *response_buf = strdup("RLS NOK\n");
         *response_len = strlen(*response_buf);
         return 0;
     }
-    char header[32];
-    snprintf(header, sizeof header, "RLS OK");
-    char *out = malloc(strlen(header) + strlen(tmp) + 2);
+
+    /* Sort by EID ascending */
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (event_array[i]->eid > event_array[j]->eid) {
+                Event *tmp = event_array[i];
+                event_array[i] = event_array[j];
+                event_array[j] = tmp;
+            }
+        }
+    }
+
+    char tmp[8192];
+    tmp[0] = '\0';
+
+    for (int i = 0; i < count; i++) {
+        Event *ev = event_array[i];
+
+        int state;
+        char current_dt[17];
+        get_current_datetime(current_dt);
+
+        if (ev->closed) state = 3;
+        else if (ev->seats_reserved >= ev->attendance_size) state = 2;
+        else if (cmp_date(ev->event_date, current_dt) < 0) state = 0;
+        else state = 1;
+
+        char part[128];
+        snprintf(part, sizeof part, " %03d %s %d %s",
+                 ev->eid, ev->name, state, ev->event_date);
+
+        strncat(tmp, part, sizeof tmp - strlen(tmp) - 1);
+    }
+
+    char *out = malloc(strlen(tmp) + 8);
     if (!out) return 1;
-    strcpy(out, header);
+
+    strcpy(out, "RLS OK");
     strcat(out, tmp);
     strcat(out, "\n");
+
     *response_buf = out;
     *response_len = strlen(out);
     return 0;

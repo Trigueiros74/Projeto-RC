@@ -4,6 +4,10 @@
    in the comments above to match your project's existing headers.
 */
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,14 +117,6 @@ int server_udp(int fd_udp, int verbose) {
         return 1;
     }
     buffer[bytes_received] = '\0';
-
-    /* Debug: print full UDP message (as a string) */
-    if (verbose) {
-        printf("----- UDP MESSAGE (%zd bytes) -----\n", bytes_received);
-        printf("%s", buffer);
-        if (bytes_received == 0 || buffer[bytes_received - 1] != '\n') putchar('\n');
-        printf("----- END UDP MESSAGE -----\n");
-    }
 
     if(verbose) {
         if(getnameinfo((struct sockaddr *)&addr, addrlen, host, sizeof host, port, sizeof port, 0) == 0) {
@@ -232,6 +228,7 @@ int server_udp(int fd_udp, int verbose) {
 int server_tcp(int fd_tcp, int verbose) {
     char command[8];
     int invalid_req = 0;
+    char delim = '\0';
     
     /* Read initial part to identify command - read up to first space or newline */
     char cmd_buf[8];
@@ -244,7 +241,12 @@ int server_tcp(int fd_tcp, int verbose) {
             fprintf(stderr, "Error reading from TCP client\n");
             return 1;
         }
-        if (r == 0 || c == ' ' || c == '\n') {
+        if (r == 0) {
+            delim = '\0';
+            break;
+        }
+        if (c == ' ' || c == '\n') {
+            delim = c;
             break;
         }
         cmd_buf[cmd_len++] = c;
@@ -265,8 +267,15 @@ int server_tcp(int fd_tcp, int verbose) {
     char *request = NULL;
     size_t req_len = 0;
     
-    /* For most commands, read until newline. For CRE, need special handling */
+    /* For most commands, read until newline. For CRE, need special handling.
+       If the delimiter was a newline, the full request is just "CMD\n". */
     if (strcmp(command, "CRE") == 0) {
+        if (delim != ' ') {
+            invalid_req = 1;
+            char *err_response = "RCE ERR\n";
+            write_exact(fd_tcp, err_response, strlen(err_response));
+            return 0;
+        }
         /* CRE format: CRE UID password name event_date attendance_size Fname Fsize <Fdata>
            Read rest of line first, then read Fdata based on Fsize */
         const size_t MAX_LINE = 8192;
@@ -348,6 +357,18 @@ int server_tcp(int fd_tcp, int verbose) {
         request = line_buf;
         req_len = line_len;
         
+    } else if (delim == '\n') {
+        /* request is only the command + newline */
+        size_t clen = strlen(command);
+        request = malloc(clen + 2);
+        if (!request) {
+            fprintf(stderr, "Memory allocation error\n");
+            return 1;
+        }
+        memcpy(request, command, clen);
+        request[clen] = '\n';
+        request[clen + 1] = '\0';
+        req_len = clen + 1;
     } else {
         /* For other commands, read until newline */
         const size_t MAX_LINE = 8192;
@@ -358,7 +379,8 @@ int server_tcp(int fd_tcp, int verbose) {
         }
         
         strcpy(line_buf, command);
-        strcat(line_buf, " ");
+        /* only append a space if the delimiter was a space */
+        if (delim == ' ') strcat(line_buf, " ");
         size_t line_len = strlen(line_buf);
         
         while (line_len < MAX_LINE - 1) {
@@ -379,19 +401,6 @@ int server_tcp(int fd_tcp, int verbose) {
         line_buf[line_len] = '\0';
         request = line_buf;
         req_len = line_len;
-    }
-
-    /* Debug: print TCP message info */
-    if (verbose) {
-        printf("----- TCP MESSAGE (%zu bytes) -----\n", req_len);
-        /* For CRE, only print non-binary part */
-        if (strcmp(command, "CRE") == 0) {
-            printf("CRE command with file data (%zu total bytes)\n", req_len);
-        } else {
-            printf("%s", request);
-            if (req_len == 0 || request[req_len - 1] != '\n') putchar('\n');
-        }
-        printf("----- END TCP MESSAGE -----\n");
     }
 
     char *response_buf = NULL;
@@ -537,6 +546,12 @@ int server_tcp(int fd_tcp, int verbose) {
         }
         else if(strcmp(command, "LST") == 0) {
             /* no arguments expected */
+            if (parse_lst(request) != 0) {
+                invalid_req = 1;
+                response_buf = strdup("RLS ERR\n");
+                response_len = strlen(response_buf);
+            }
+            else
             if(cmd_lst(&response_buf, &response_len) != 0) {
                 free(response_buf);
                 response_buf = strdup("RLS NOK\n");

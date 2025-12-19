@@ -1,3 +1,15 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200112L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,7 +141,6 @@ int interact(struct addrinfo *res_udp, struct addrinfo *res_tcp, int fd_udp) {
                 continue;
             }
             if(parse_login(buffer, request) == 0) {
-                printf("DEBUG: parse_login produced: '%s'\n", request);
                 char password[MAX_PASS_LEN];
                 char temp_UID[16];
                 if(sscanf(buffer, "login %15s %63s", temp_UID, password) != 2) {
@@ -230,7 +241,6 @@ int interact(struct addrinfo *res_udp, struct addrinfo *res_tcp, int fd_udp) {
         }
         else if(strcmp(command, "list") == 0) {
             if(parse_list(buffer, request) == 0) {
-                printf("DEBUG: parse_list produced: '%s'\n", request);
                 if(cmd_list(request, res_tcp) == 1)
                     return 1;
             }

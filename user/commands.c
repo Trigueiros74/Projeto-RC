@@ -3,7 +3,18 @@
    Follows the style and structure of the provided game commands.c.
 */
 
-#include "commands.h"
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200112L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,8 +26,12 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 
+#include "commands.h"
+
 #define TRY_LIMIT 3
 #define RESPONSE_LEN 32
+#define TCP_LINE_MAX (1024 * 1024) /* 1 MiB cap for single-line text replies */
+#define TCP_TIMEOUT_SEC 15
 
 /* Declarations for functions defined in user.c */
 void add_user_session(const char *UID, const char *password);
@@ -115,6 +130,102 @@ int send_tcp_request(char *request, struct addrinfo *res, char *response, size_t
     response[total_read] = '\0';
 
     close(fd);
+    return 0;
+}
+
+/* Read a single text line (ending in '\n') from TCP fd, with an upper bound.
+   Returns 0 on success, 1 on error/overflow. The returned buffer is NUL-terminated
+   and must be freed by caller. */
+static int tcp_read_line_alloc(int fd, char **out, size_t *out_len, size_t max_len) {
+    if (!out || !out_len || max_len == 0) return 1;
+
+    size_t cap = 1024;
+    if (cap > max_len) cap = max_len;
+    char *buf = malloc(cap + 1);
+    if (!buf) return 1;
+
+    size_t len = 0;
+    while (1) {
+        char c;
+        ssize_t r = read(fd, &c, 1);
+        if (r < 0) {
+            free(buf);
+            return 1;
+        }
+        if (r == 0) {
+            /* EOF */
+            break;
+        }
+
+        if (len == max_len) {
+            free(buf);
+            return 1;
+        }
+        if (len + 1 > cap) {
+            size_t new_cap = cap * 2;
+            if (new_cap > max_len) new_cap = max_len;
+            char *new_buf = realloc(buf, new_cap + 1);
+            if (!new_buf) {
+                free(buf);
+                return 1;
+            }
+            buf = new_buf;
+            cap = new_cap;
+        }
+
+        buf[len++] = c;
+        if (c == '\n') break;
+    }
+
+    buf[len] = '\0';
+    *out = buf;
+    *out_len = len;
+    return 0;
+}
+
+/* Send a textual request over TCP and read exactly one reply line (up to '\n').
+   This avoids blocking if the server doesn't close the connection promptly.
+   Returns 0 on success and allocates *response (caller frees). */
+static int send_tcp_request_line(const char *request, struct addrinfo *res, char **response, size_t *response_len) {
+    if (!request || !res || !response || !response_len) return 1;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == -1) return 1;
+
+    struct timeval tv;
+    tv.tv_sec = TCP_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(fd, res->ai_addr, res->ai_addrlen) == -1) {
+        close(fd);
+        return 1;
+    }
+
+    size_t to_write = strlen(request);
+    size_t written = 0;
+    while (written < to_write) {
+        ssize_t n = write(fd, request + written, to_write - written);
+        if (n <= 0) {
+            close(fd);
+            return 1;
+        }
+        written += (size_t)n;
+    }
+
+    shutdown(fd, SHUT_WR);
+
+    char *line = NULL;
+    size_t line_len = 0;
+    if (tcp_read_line_alloc(fd, &line, &line_len, TCP_LINE_MAX) != 0) {
+        close(fd);
+        return 1;
+    }
+
+    close(fd);
+    *response = line;
+    *response_len = line_len;
     return 0;
 }
 
@@ -466,13 +577,6 @@ int cmd_create(char *request, struct addrinfo *res) {
     memcpy(payload + off, fsize_str, fslen); off += fslen;         // " Fsize "
     if(fsize > 0) { memcpy(payload + off, fdata, fsize); off += fsize; }  // File bytes
 
-    printf("Debug: Comando CRE completo: \"");
-    fwrite(payload, 1, req_len + fslen, stdout);  // Print header + fsize (sem file bytes)
-    printf("\"\n");
-    printf("Debug: Tamanho do comando: %zu bytes\n", req_len + fslen);
-    printf("Debug: Tamanho do ficheiro: %zu bytes\n", fsize);
-    printf("Debug: Payload total: %zu bytes\n", payload_len);
-
     /* send binary payload */
     char *response = malloc(1024);
     if(!response) { free(fdata); free(payload); fprintf(stderr, "Out of memory\n"); return 1; }
@@ -647,18 +751,14 @@ int cmd_myevents(char *request, int fd_udp, struct addrinfo *res) {
    Response: "RLS <STATUS>\n" with list data appended, or status EMPTY/ERR
 */
 int cmd_list(char *request, struct addrinfo *res) {
-    char *response = (char *) malloc(sizeof(char) * 2048);
-    if(response == NULL) {
-        fprintf(stderr, "Error while communicating with server! Ending session.\n");
-        return 1;
-    }
+    char *response = NULL;
+    size_t response_len = 0;
 
     char res_cmd[4];
     char status[8];
 
-    if(send_tcp_request(request, res, response, 2048) == 1) {
+    if(send_tcp_request_line(request, res, &response, &response_len) == 1) {
         fprintf(stderr, "Error while communicating with server! Ending session.\n");
-        free(response);
         return 1;
     }
 
@@ -673,8 +773,6 @@ int cmd_list(char *request, struct addrinfo *res) {
         free(response);
         return 1;
     }
-
-    printf("DEBUG: Full list response: '%s'\n", response);
 
     if(strcmp(status, "OK") == 0) {
         /* print list payload after the two tokens */
@@ -769,8 +867,6 @@ int cmd_show(char *request, struct addrinfo *res) {
         free(response);
         return 1;
     }
-
-    printf("DEBUG: Full show response: '%s'\n", response);
 
     if(strcmp(status, "OK") == 0) {
         /* Response format: RSE OK UID name event_date attendance_size reserved Fname Fsize Fdata
@@ -933,9 +1029,6 @@ int cmd_myreservations(char *request, int fd_udp, struct addrinfo *res) {
         fprintf(stderr, "Invalid response from server! Ending session.\n");
         return 1;
     }
-
-    // DEBUG: Show full response
-    printf("DEBUG: Full response: '%s'\n", response);
 
     if(strcmp(status, "OK") == 0) {
         /* Print reservations: EID date(dd-mm-yyyy hh:mm:ss) value */

@@ -1,64 +1,40 @@
-#ifndef COMMANDS
-#define COMMANDS
+#ifndef COMMANDS_H
+#define COMMANDS_H
 
 #include <stddef.h>
 
-#define MAX_FILENAME_LEN 24
-#define MAX_FDATA_SIZE (10 * 1024 * 1024)  /* 10 MB */
-#define MAX_EID 999  /* EID is 3-digit: 001-999 */
-#define MAX_MYRESERVATIONS_DISPLAY 50  /* myreservations command shows max 50 (most recent) */
+#include "storage.h"
 
-typedef struct {
-    char uid[7];
-    char password[128];
-    int logged_in;
-    int used;
-} User;
+/* Longest UDP reply the server may produce: LST-style listings are sent over
+   TCP, so the bound only has to cover RME (999 events) and RMR (50
+   reservations). */
+#define UDP_REPLY_MAX 8192
 
-typedef struct {
-    int eid;
-    char owner[7];
-    char name[11];
-    char event_date[17];  /* dd-mm-yyyy hh:mm */
-    int attendance_size;
-    int seats_reserved;
-    char fname[MAX_FILENAME_LEN+1];
-    int fsize;
-    char *fdata;
-    int closed;
-    int used;
-} Event;
+/* ---- UDP handlers -------------------------------------------------------
+ * They format the complete reply (terminated by '\n') into `reply`, which
+ * holds UDP_REPLY_MAX bytes, and return its length. */
+size_t cmd_lin(char *reply, const char *uid, const char *password);
+size_t cmd_lou(char *reply, const char *uid, const char *password);
+size_t cmd_unr(char *reply, const char *uid, const char *password);
+size_t cmd_lme(char *reply, const char *uid, const char *password);
+size_t cmd_lmr(char *reply, const char *uid, const char *password);
 
-typedef struct {
-    char uid[7];
-    int eid;
-    int people;
-    char timestamp[20];  /* dd-mm-yyyy hh:mm:ss */
-    int used;
-} Reservation;
+/* ---- TCP handlers -------------------------------------------------------
+ * These write their reply straight to the socket, because it may carry a file
+ * of up to 10 MB that must never be buffered in full. They return 0 when the
+ * whole reply reached the client and -1 otherwise; `status` receives the
+ * protocol status word for the verbose log. */
+int cmd_cre(int fd, const char *uid, const char *password, const char *name,
+            const char *event_date, int attendance_size, const char *fname,
+            const char *staged_path, char status[8]);
+int cmd_cls(int fd, const char *uid, const char *password, const char *eid, char status[8]);
+int cmd_lst(int fd, char status[8]);
+int cmd_sed(int fd, const char *eid, char status[8]);
+int cmd_rid(int fd, const char *uid, const char *password, const char *eid, int people,
+            char status[8]);
+int cmd_cps(int fd, const char *uid, const char *oldpass, const char *newpass, char status[8]);
 
-/* UDP handlers (fill response buffer, return 0 on success, 1 on fatal error) */
-int cmd_lin(char *response, const char *uid, const char *password);
-int cmd_lou(char *response, const char *uid, const char *password);
-int cmd_unr(char *response, const char *uid, const char *password);
-int cmd_lme(char *response, const char *uid, const char *password);
-int cmd_lmr(char *response, const char *uid, const char *password);
+/* Sends `len` bytes, retrying on short writes and on EINTR. */
+int write_all(int fd, const char *buf, size_t len);
 
-/* TCP handlers (allocate *response_buf via malloc, set *response_len; return 0 on success) */
-int cmd_cre(char **response_buf, size_t *response_len, const char *uid, const char *password,
-            const char *name, const char *event_date, int attendance_size,
-            const char *fname, int fsize, const char *fdata);
-
-int cmd_cls(char **response_buf, size_t *response_len, const char *uid, const char *password, const char *eid);
-int cmd_lst(char **response_buf, size_t *response_len);
-int cmd_sed(char **response_buf, size_t *response_len, const char *eid);
-int cmd_rid(char **response_buf, size_t *response_len, const char *uid, const char *password, const char *eid, int people);
-int cmd_cps(char **response_buf, size_t *response_len, const char *uid, const char *oldpass, const char *newpass);
-
-/* lifecycle helpers */
-int commands_init(void);
-int init_persistence(void);  /* Initialize file-based persistence system */
-
-void commands_cleanup(void);
-
-#endif
+#endif /* COMMANDS_H */

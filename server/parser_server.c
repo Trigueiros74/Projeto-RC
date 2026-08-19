@@ -1,330 +1,184 @@
-/* parser_server.c - parsers for Event Reservation protocol
-   Returns 0 on success, 1 on parse/validation error.
-*/
+/* parser_server.c - validation of the messages the ES server receives.
+ *
+ * The protocol is strict: fields are separated by exactly one space and the
+ * message ends with a single '\n'. Anything else earns an ERR reply, which is
+ * why the parsers below scan the message by hand instead of relying on
+ * sscanf(), whose "%s" happily swallows runs of whitespace.
+ */
 
-#include "parser_server.h"
-#include <stdio.h>
-#include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
+#include <string.h>
 
-#define MAX_PASSWORD_LEN 127
-#define MAX_FSIZE (10 * 1024 * 1024) /* 10 MiB */
+#include "parser_server.h"
+#include "storage.h"
 
-/* Keep original validate_string_spaces semantics:
-   returns 1 on invalid spacing, 0 otherwise.
-   The function expects the buffer to end with '\n'. */
-int validate_string_spaces(const char *str, int limit) {
-    int space_flag = 0;
-    int count = 0;
+/* ========================================================================
+ * Field validators
+ * ==================================================================== */
 
-    if (!str) return 1;
-    size_t len = strlen(str);
-    if (len == 0) return 1;
-    /* Accept lines ending in '\n' or '\r\n'. Normalize effective length for checks. */
-    if (str[len - 1] != '\n') return 1;
-    int has_cr = 0;
-    if (len >= 2 && str[len - 2] == '\r') {
-        has_cr = 1;
-    }
-
-    /* iterate up to the character before the terminating newline (and optional CR) */
-    size_t end = len - 1 - (has_cr ? 1 : 0);
-    for (size_t i = 0; i < end; i++) {
-        if (isspace((unsigned char)str[i])) {
-            if (space_flag)
-                return 1; 
-            count++;
-            space_flag = 1;
-        } else {
-            space_flag = 0;
-        }
-
-        if (limit != 0 && count == limit)
-            break;
-    }
-
-    if (isspace((unsigned char)str[0])) return 1;
-    /* Check that the char before newline (or CR) is not a space when no limit set */
-    if (limit == 0) {
-        if (end == 0) return 1; /* empty before newline */
-        if (isspace((unsigned char)str[end - 1])) return 1;
-    }
-
-    return 0;
-}
-
-/* helpers */
-static int is_number_str(const char *s) {
-    if (!s || *s == '\0') return 0;
-    for (const char *p = s; *p; ++p) if(!isdigit((unsigned char)*p)) return 0;
+static int all_digits(const char *s, size_t len) {
+    size_t i;
+    for (i = 0; i < len; i++)
+        if (!isdigit((unsigned char)s[i])) return 0;
     return 1;
 }
 
-static int validate_uid_str(const char *s) {
-    /* expects string of exactly 6 digits */
-    if (!s) return 0;
-    if (strlen(s) != 6) return 0;
-    return is_number_str(s);
+int valid_uid_field(const char *s) {
+    return s && strlen(s) == UID_LEN && all_digits(s, UID_LEN);
 }
 
-static int validate_eid_str(const char *s) {
-    /* expects exactly 3 digits */
-    if (!s) return 0;
-    if (strlen(s) != 3) return 0;
-    return is_number_str(s);
-}
-
-static int validate_name_str(const char *s) {
-    /* single word, up to 10 alphanumeric chars only */
-    if (!s) return 0;
-    size_t len = strlen(s);
-    if (len == 0 || len > 10) return 0;
-    for (size_t i = 0; i < len; ++i)
+int valid_password_field(const char *s) {
+    size_t i;
+    if (!s || strlen(s) != PASSWORD_LEN) return 0;
+    for (i = 0; i < PASSWORD_LEN; i++)
         if (!isalnum((unsigned char)s[i])) return 0;
     return 1;
 }
 
-static int validate_date_str(const char *s) {
-    /* dd-mm-yyyy hh:mm format (16 chars) */
-    if (!s || strlen(s) != 16) return 0;
+int valid_eid_field(const char *s) {
+    if (!s || strlen(s) != 3 || !all_digits(s, 3)) return 0;
+    return atoi(s) >= EID_MIN && atoi(s) <= EID_MAX;
+}
+
+int valid_event_name_field(const char *s) {
+    size_t len, i;
+    if (!s) return 0;
+    len = strlen(s);
+    if (len == 0 || len > EVENT_NAME_MAX) return 0;
+    for (i = 0; i < len; i++)
+        if (!isalnum((unsigned char)s[i])) return 0;
+    return 1;
+}
+
+/* dd-mm-yyyy hh:mm, with a calendar check so that 31-02-2026 is rejected. */
+int valid_event_date_field(const char *s) {
+    int day, month, year, hour, minute, month_days;
+
+    if (!s || strlen(s) != EVENT_DATE_LEN) return 0;
     if (s[2] != '-' || s[5] != '-' || s[10] != ' ' || s[13] != ':') return 0;
-    
-    char dd[3] = {s[0], s[1], '\0'};
-    char mm[3] = {s[3], s[4], '\0'};
-    char yyyy[5] = {s[6], s[7], s[8], s[9], '\0'};
-    char hh[3] = {s[11], s[12], '\0'};
-    char min[3] = {s[14], s[15], '\0'};
-    
-    if (!is_number_str(dd) || !is_number_str(mm) || !is_number_str(yyyy) ||
-        !is_number_str(hh) || !is_number_str(min)) return 0;
-    
-    int di = atoi(dd), mi = atoi(mm), yi = atoi(yyyy);
-    int hi = atoi(hh), mini = atoi(min);
-    
-    if (mi < 1 || mi > 12 || yi < 1900 || yi > 9999) return 0;
-    if (hi < 0 || hi > 23 || mini < 0 || mini > 59) return 0;
-    
-    int mdays = 31;
-    if (mi == 4 || mi == 6 || mi == 9 || mi == 11) mdays = 30;
-    else if (mi == 2) {
-        int leap = ((yi % 4 == 0 && yi % 100 != 0) || (yi % 400 == 0));
-        mdays = leap ? 29 : 28;
-    }
-    if (di < 1 || di > mdays) return 0;
-    return 1;
+    if (!all_digits(s, 2) || !all_digits(s + 3, 2) || !all_digits(s + 6, 4) ||
+        !all_digits(s + 11, 2) || !all_digits(s + 14, 2)) return 0;
+
+    day    = (s[0]  - '0') * 10 + (s[1]  - '0');
+    month  = (s[3]  - '0') * 10 + (s[4]  - '0');
+    year   = (s[6]  - '0') * 1000 + (s[7] - '0') * 100 + (s[8] - '0') * 10 + (s[9] - '0');
+    hour   = (s[11] - '0') * 10 + (s[12] - '0');
+    minute = (s[14] - '0') * 10 + (s[15] - '0');
+
+    if (month < 1 || month > 12 || year < 1900) return 0;
+    if (hour > 23 || minute > 59) return 0;
+
+    month_days = 31;
+    if (month == 4 || month == 6 || month == 9 || month == 11) month_days = 30;
+    else if (month == 2)
+        month_days = ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) ? 29 : 28;
+
+    return day >= 1 && day <= month_days;
 }
 
-static int validate_fname_str(const char *s) {
+/* "nnn...nnn.xxx": alphanumerics plus '-', '_' and '.', a 3-letter extension
+   and at most 24 characters in total. The name also has to stay a single path
+   component, since the server uses it verbatim to build a file path. */
+int valid_fname_field(const char *s) {
+    size_t len, i;
+    const char *dot;
+
     if (!s) return 0;
-    size_t len = strlen(s);
-    if (len == 0 || len > 24) return 0;
-    /* must contain a dot and 3-letter extension */
-    const char *dot = strrchr(s, '.');
-    if (!dot) return 0;
-    size_t ext_len = strlen(dot+1);
-    if (ext_len != 3) return 0;
-    for (const char *p = s; *p; ++p) {
-        if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_' || *p == '.'))
-            return 0;
+    len = strlen(s);
+    if (len == 0 || len > FILENAME_MAX_LEN) return 0;
+    if (strcmp(s, ".") == 0 || strcmp(s, "..") == 0) return 0;
+
+    dot = strrchr(s, '.');
+    if (!dot || dot == s || strlen(dot + 1) != 3) return 0;
+
+    for (i = 0; i < len; i++) {
+        char c = s[i];
+        if (!(isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.')) return 0;
     }
     return 1;
 }
 
-int validate_password_str(const char *s) {
+/* Bounded numeric fields are parsed by hand: strtol on an unbounded digit run
+   would be the easy way to overflow the reply with a nonsense value. */
+static int parse_bounded_number(const char *s, size_t max_digits, long min, long max, long *out) {
+    size_t len;
+    long value;
+
     if (!s) return 0;
-    size_t len = strlen(s);
-    if (len != 8) return 0; /* must be exactly 8 chars */
-    for (const char *p = s; *p; ++p) {
-        if (!isalnum((unsigned char)*p)) return 0;
-    }
+    len = strlen(s);
+    if (len == 0 || len > max_digits || !all_digits(s, len)) return 0;
+
+    value = strtol(s, NULL, 10);
+    if (value < min || value > max) return 0;
+    *out = value;
     return 1;
 }
 
-/* ----------------- UDP parsers -----------------
-   LIN UID password\n
-   LOU UID password\n
-   UNR UID password\n
-   LME UID password\n
-   LMR UID password\n
-   For these, UID is 6 digits; password is a non-space token.
-*/
-int parse_lin(char *buffer, char *uid, char *password) {
-    char extra[2];
-    if (sscanf(buffer, "%*s %6s %127s %1s", uid, password, extra) != 2)
-        return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    if (!validate_uid_str(uid)) return 1;
-    if (!validate_password_str(password)) return 1;
+int valid_attendance_field(const char *s, int *out) {
+    long value;
+    if (!parse_bounded_number(s, 3, ATTENDANCE_MIN, ATTENDANCE_MAX, &value)) return 0;
+    *out = (int)value;
+    return 1;
+}
+
+int valid_people_field(const char *s, int *out) {
+    long value;
+    if (!parse_bounded_number(s, 3, 1, 999, &value)) return 0;
+    *out = (int)value;
+    return 1;
+}
+
+int valid_fsize_field(const char *s, long *out) {
+    return parse_bounded_number(s, FSIZE_MAX_DIGITS, 0, FDATA_MAX_SIZE, out);
+}
+
+/* ========================================================================
+ * UDP message parsers
+ *
+ * The TCP side reads its messages field by field straight off the socket (see
+ * ES.c), because a CRE request carries binary data that cannot be treated as
+ * a text line. Datagrams, in contrast, always arrive whole.
+ * ==================================================================== */
+
+/* Splits "CMD f1 ... fn\n" into exactly n fields. Returns 0 when the message
+   matches that shape exactly: no repeated spaces, no missing or extra field,
+   nothing after the terminating newline. */
+static int split_fields(const char *buffer, int n, char *const out[], const size_t cap[]) {
+    const char *p = buffer;
+    int i;
+
+    while (*p && *p != ' ' && *p != '\n') p++;   /* the command word */
+
+    for (i = 0; i < n; i++) {
+        const char *start;
+        size_t len;
+
+        if (*p != ' ') return 1;
+        p++;
+        start = p;
+        while (*p && *p != ' ' && *p != '\n') p++;
+        len = (size_t)(p - start);
+        if (len == 0 || len >= cap[i]) return 1;
+        memcpy(out[i], start, len);
+        out[i][len] = '\0';
+    }
+
+    return (p[0] == '\n' && p[1] == '\0') ? 0 : 1;
+}
+
+/* All five UDP requests carry the same two fields. */
+static int parse_credentials(const char *buffer, char *uid, char *password) {
+    char *const fields[] = { uid, password };
+    const size_t caps[] = { UID_LEN + 1, PASSWORD_LEN + 1 };
+
+    if (split_fields(buffer, 2, fields, caps) != 0) return 1;
+    if (!valid_uid_field(uid) || !valid_password_field(password)) return 1;
     return 0;
 }
 
-int parse_lou(char *buffer, char *uid, char *password) {
-    char extra[2];
-    if (sscanf(buffer, "%*s %6s %127s %1s", uid, password, extra) != 2)
-        return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    if (!validate_uid_str(uid)) return 1;
-    if (!validate_password_str(password)) return 1;
-    return 0;
-}
-
-int parse_unr(char *buffer, char *uid, char *password) {
-    char extra[2];
-    if (sscanf(buffer, "%*s %6s %127s %1s", uid, password, extra) != 2)
-        return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    if (!validate_uid_str(uid)) return 1;
-    if (!validate_password_str(password)) return 1;
-    return 0;
-}
-
-int parse_lme(char *buffer, char *uid, char *password) {
-    char extra[2];
-    if (sscanf(buffer, "%*s %6s %127s %1s", uid, password, extra) != 2)
-        return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    if (!validate_uid_str(uid)) return 1;
-    if (!validate_password_str(password)) return 1;
-    return 0;
-}
-
-int parse_lmr(char *buffer, char *uid, char *password) {
-    char extra[2];
-    if (sscanf(buffer, "%*s %6s %127s %1s", uid, password, extra) != 2)
-        return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    if (!validate_uid_str(uid)) return 1;
-    if (!validate_password_str(password)) return 1;
-    return 0;
-}
-
-/* ----------------- TCP parsers -----------------
-   parse_cre_header: CRE UID password name event_date attendance_size Fname\n
-   event_date is dd-mm-yyyy hh:mm (16 chars with space)
-*/
-int parse_cre_header(char *header, char *uid, char *password, char *name, char *event_date, int *attendance_size, char *fname) {
-    char *p = header;
-    
-    /* Skip "CRE " */
-    while (*p && *p != ' ') p++;
-    if (*p == ' ') p++;
-    
-    /* UID (6 chars) */
-    char *uid_start = p;
-    while (*p && *p != ' ') p++;
-    size_t uid_len = p - uid_start;
-    if (uid_len != 6) return 1;
-    memcpy(uid, uid_start, uid_len);
-    uid[uid_len] = '\0';
-    if (*p == ' ') p++;
-    
-    /* password */
-    char *pass_start = p;
-    while (*p && *p != ' ') p++;
-    size_t pass_len = p - pass_start;
-    if (pass_len >= 128) return 1;
-    memcpy(password, pass_start, pass_len);
-    password[pass_len] = '\0';
-    if (*p == ' ') p++;
-    
-    /* name */
-    char *name_start = p;
-    while (*p && *p != ' ') p++;
-    size_t name_len = p - name_start;
-    if (name_len > 10) return 1;
-    memcpy(name, name_start, name_len);
-    name[name_len] = '\0';
-    if (*p == ' ') p++;
-    
-    /* event_date (16 chars: dd-mm-yyyy hh:mm) */
-    if (strlen(p) < 16) return 1;
-    memcpy(event_date, p, 16);
-    event_date[16] = '\0';
-    p += 16;
-    if (*p == ' ') p++;
-    
-    /* attendance_size */
-    int asize;
-    if (sscanf(p, "%d", &asize) != 1) return 1;
-    while (*p && *p != ' ') p++;
-    if (*p == ' ') p++;
-    
-    /* fname */
-    char *fname_start = p;
-    while (*p && *p != ' ' && *p != '\n' && *p != '\r') p++;
-    size_t fname_len = p - fname_start;
-    if (fname_len > 24) return 1;
-    memcpy(fname, fname_start, fname_len);
-    fname[fname_len] = '\0';
-    
-    /* Validate */
-    if (!validate_uid_str(uid)) return 1;
-    if (!validate_password_str(password)) return 1;
-    if (!validate_name_str(name)) return 1;
-    if (!validate_date_str(event_date)) return 1;
-    if (asize < 10 || asize > 999) return 1;
-    if (!validate_fname_str(fname)) return 1;
-    *attendance_size = asize;
-    return 0;
-}
-
-/* CLS UID password EID\n */
-int parse_cls(char *buffer, char *uid, char *password, char *eid) {
-    char extra[2];
-    if (sscanf(buffer, "%*s %6s %127s %3s %1s", uid, password, eid, extra) != 3)
-        return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    if (!validate_uid_str(uid)) return 1;
-    if (!validate_password_str(password)) return 1;
-    if (!validate_eid_str(eid)) return 1;
-    return 0;
-}
-
-/* LST\n  (no args) */
-int parse_lst(char *buffer) {
-    char extra[2];
-    int r = sscanf(buffer, "%*s %1s", extra);
-    if (r != 0 && r != -1) return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    return 0;
-}
-
-/* SED EID\n */
-int parse_sed(char *buffer, char *eid) {
-    char extra[2];
-    if (sscanf(buffer, "%*s %3s %1s", eid, extra) != 1)
-        return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    if (!validate_eid_str(eid)) return 1;
-    return 0;
-}
-
-/* RID UID password EID people\n */
-int parse_rid(char *buffer, char *uid, char *password, char *eid, int *people) {
-    char extra[2];
-    if (sscanf(buffer, "%*s %6s %127s %3s %d %1s", uid, password, eid, people, extra) != 4)
-        return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    if (!validate_uid_str(uid)) return 1;
-    if (!validate_password_str(password)) return 1;
-    if (!validate_eid_str(eid)) return 1;
-    if (*people < 1 || *people > 999) return 1;
-    return 0;
-}
-
-/* CPS UID oldPassword newPassword\n */
-int parse_cps(char *buffer, char *uid, char *oldpass, char *newpass) {
-
-
-
-    // USAR 7 - 9 - 9 variáveis estaticas
-
-    char extra[2];
-    if (sscanf(buffer, "%*s %6s %127s %127s %1s", uid, oldpass, newpass, extra) != 3)
-        return 1;
-    if (validate_string_spaces(buffer, 0) == 1) return 1;
-    if (!validate_uid_str(uid)) return 1;
-    if (!validate_password_str(oldpass) || !validate_password_str(newpass)) return 1;
-    return 0;
-}
+int parse_lin(const char *buffer, char *uid, char *password) { return parse_credentials(buffer, uid, password); }
+int parse_lou(const char *buffer, char *uid, char *password) { return parse_credentials(buffer, uid, password); }
+int parse_unr(const char *buffer, char *uid, char *password) { return parse_credentials(buffer, uid, password); }
+int parse_lme(const char *buffer, char *uid, char *password) { return parse_credentials(buffer, uid, password); }
+int parse_lmr(const char *buffer, char *uid, char *password) { return parse_credentials(buffer, uid, password); }

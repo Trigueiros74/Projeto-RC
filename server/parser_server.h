@@ -1,22 +1,25 @@
-#ifndef PARSER_SERVER
-#define PARSER_SERVER
+#ifndef PARSER_SERVER_H
+#define PARSER_SERVER_H
 
-int validate_string_spaces(const char *str, int limit);
+/* Field validators. Each returns 1 when the value obeys the protocol. */
+int valid_uid_field(const char *s);
+int valid_password_field(const char *s);
+int valid_eid_field(const char *s);
+int valid_event_name_field(const char *s);
+int valid_event_date_field(const char *s);
+int valid_fname_field(const char *s);
+int valid_attendance_field(const char *s, int *out);
+int valid_people_field(const char *s, int *out);
+int valid_fsize_field(const char *s, long *out);
 
-/* Validate password: exactly 8 alphanumeric characters */
-int validate_password_str(const char *s);
+/* Message parsers. They return 0 when the whole message is well formed and 1
+   otherwise, in which case the caller answers with the protocol's ERR status.
+   The output buffers must hold at least the sizes declared in storage.h plus
+   room for the terminator. */
+int parse_lin(const char *buffer, char *uid, char *password);
+int parse_lou(const char *buffer, char *uid, char *password);
+int parse_unr(const char *buffer, char *uid, char *password);
+int parse_lme(const char *buffer, char *uid, char *password);
+int parse_lmr(const char *buffer, char *uid, char *password);
 
-int parse_lin(char *buffer, char *uid, char *password);
-int parse_lou(char *buffer, char *uid, char *password);
-int parse_unr(char *buffer, char *uid, char *password);
-int parse_lme(char *buffer, char *uid, char *password);
-int parse_lmr(char *buffer, char *uid, char *password);
-
-int parse_cre_header(char *header, char *uid, char *password, char *name, char *event_date, int *attendance_size, char *fname);
-int parse_cls(char *buffer, char *uid, char *password, char *eid);
-int parse_lst(char *buffer);
-int parse_sed(char *buffer, char *eid);
-int parse_rid(char *buffer, char *uid, char *password, char *eid, int *people);
-int parse_cps(char *buffer, char *uid, char *oldpass, char *newpass);
-
-#endif
+#endif /* PARSER_SERVER_H */

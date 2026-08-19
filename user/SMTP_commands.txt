@@ -1,5 +1,0 @@
-SMTP commands:
-HELO
-MAIL FROM
-RCPT TO
-DATA

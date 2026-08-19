@@ -1,0 +1,16 @@
+# Build output
+*.o
+/ES
+/user
+server/ES
+user/user
+
+# Server state: recreated on demand, never part of the source
+ESDIR/
+server/ESDIR/
+
+# Editor and OS noise
+.claude/
+.DS_Store
+*.swp
+*~

@@ -1,1203 +1,419 @@
-/* commands.c - simple in-memory implementations of the ES command handlers
+/* commands.c - business logic behind every protocol message of the ES server.
  *
- * Matches the server code's expected signatures:
- *  - UDP: int cmd_xxx(char *response, ...); fills response and returns 0 on success, 1 on fatal error.
- *  - TCP: int cmd_xxx(char **response_buf, size_t *response_len, ...); allocates response_buf (malloc),
- *         sets response_len and returns 0 on success, nonzero on error.
- *
- * NOTE: includes basic memory limits tuned for testing. Not production-grade.
+ * Each handler takes the storage lock for the duration of its work: shared for
+ * the read-only commands (LST, SED, LME, LMR) and exclusive for the ones that
+ * change the state (LIN, LOU, UNR, CRE, CLS, RID, CPS). Because handlers run
+ * in different processes, that lock is what keeps a reservation from being
+ * counted twice or a password from being half written.
  */
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <dirent.h>
 #include <unistd.h>
-#include <errno.h>
-#include <limits.h>
 
 #include "commands.h"
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
+#define STREAM_CHUNK 65536
 
-#define UDP_RESPONSE_MAX 2048
+/* ========================================================================
+ * Socket helpers
+ * ==================================================================== */
 
-/* Base directory for persistent storage */
-#define BASE_DIR "ESDIR"
-#define USERS_DIR BASE_DIR "/USERS"
-#define EVENTS_DIR BASE_DIR "/EVENTS"
-
-/* Dynamic data structures */
-typedef struct UserNode {
-    User data;
-    struct UserNode *next;
-} UserNode;
-
-typedef struct EventNode {
-    Event data;
-    struct EventNode *next;
-} EventNode;
-
-typedef struct ReservationNode {
-    Reservation data;
-    struct ReservationNode *next;
-} ReservationNode;
-
-static UserNode *users_head = NULL;
-static EventNode *events_head = NULL;
-static ReservationNode *reservations_head = NULL;
-static int next_eid = 1;
-
-/* ========== HELPER FUNCTIONS ========== */
-
-/* Get current timestamp in dd-mm-yyyy hh:mm:ss format */
-static void get_current_timestamp(char *out) {
-    time_t now = time(NULL);
-    struct tm t;
-    if (!out) return;
-    if (localtime_r(&now, &t) == NULL) {
-        out[0] = '\0';
-        return;
-    }
-    /* 19 chars + NUL */
-    (void)strftime(out, 20, "%d-%m-%Y %H:%M:%S", &t);
-}
-
-/* Get current date+time in dd-mm-yyyy hh:mm format (for event date comparisons) */
-static void get_current_datetime(char *out) {
-    time_t now = time(NULL);
-    struct tm t;
-    if (!out) return;
-    if (localtime_r(&now, &t) == NULL) {
-        out[0] = '\0';
-        return;
-    }
-    /* 16 chars + NUL */
-    (void)strftime(out, 17, "%d-%m-%Y %H:%M", &t);
-}
-
-/* Find user by UID */
-static User *find_user(const char *uid) {
-    UserNode *curr = users_head;
-    while (curr) {
-        if (curr->data.used && strcmp(curr->data.uid, uid) == 0) 
-            return &curr->data;
-        curr = curr->next;
-    }
-    return NULL;
-}
-
-/* Find event by EID string */
-static Event *find_event_by_eid_str(const char *eidstr) {
-    if (!eidstr) return NULL;
-    if (strlen(eidstr) != 3) return NULL;
-    int eid = atoi(eidstr);
-    if (eid <= 0) return NULL;
-    
-    EventNode *curr = events_head;
-    while (curr) {
-        if (curr->data.used && curr->data.eid == eid) 
-            return &curr->data;
-        curr = curr->next;
-    }
-    return NULL;
-}
-
-/* Create new event slot */
-static Event *create_event_slot(void) {
-    if (next_eid > MAX_EID) return NULL;  /* Reached EID limit (999) */
-    
-    EventNode *new_node = malloc(sizeof(EventNode));
-    if (!new_node) return NULL;
-    
-    memset(&new_node->data, 0, sizeof(Event));
-    new_node->data.used = 1;
-    new_node->data.fdata = NULL;
-    new_node->data.seats_reserved = 0;
-    new_node->data.closed = 0;
-    new_node->data.eid = next_eid++;
-    if (next_eid > MAX_EID) next_eid = 1;  /* Wrap around */
-    
-    new_node->next = events_head;
-    events_head = new_node;
-    
-    return &new_node->data;
-}
-
-/* Free event data */
-static void free_event(Event *e) {
-    if (!e) return;
-    if (e->fdata) {
-        free(e->fdata);
-        e->fdata = NULL;
-    }
-    memset(e, 0, sizeof(Event));
-}
-
-/* Create new reservation slot */
-static Reservation *create_reservation_slot(void) {
-    ReservationNode *new_node = malloc(sizeof(ReservationNode));
-    if (!new_node) return NULL;
-    
-    memset(&new_node->data, 0, sizeof(Reservation));
-    new_node->data.used = 1;
-    
-    new_node->next = reservations_head;
-    reservations_head = new_node;
-    
-    return &new_node->data;
-}
-
-/* Compare date+time. Format: dd-mm-yyyy hh:mm 
-   Returns: -1 if d1 < d2, 0 if equal, 1 if d1 > d2
-   Direct comparison of components: year, month, day, hour, minute
-*/
-static int cmp_date(const char *d1, const char *d2) {
-    if (!d1 || !d2) return 0;
-    if (strlen(d1) != 16 || strlen(d2) != 16) return 0;
-    
-    /* Compare year (positions 6-9) */
-    int cmp = strncmp(d1 + 6, d2 + 6, 4);
-    if (cmp != 0) return (cmp < 0) ? -1 : 1;
-    
-    /* Compare month (positions 3-4) */
-    cmp = strncmp(d1 + 3, d2 + 3, 2);
-    if (cmp != 0) return (cmp < 0) ? -1 : 1;
-    
-    /* Compare day (positions 0-1) */
-    cmp = strncmp(d1, d2, 2);
-    if (cmp != 0) return (cmp < 0) ? -1 : 1;
-    
-    /* Compare hour (positions 11-12) */
-    cmp = strncmp(d1 + 11, d2 + 11, 2);
-    if (cmp != 0) return (cmp < 0) ? -1 : 1;
-    
-    /* Compare minute (positions 14-15) */
-    cmp = strncmp(d1 + 14, d2 + 14, 2);
-    return (cmp < 0) ? -1 : (cmp > 0) ? 1 : 0;
-}
-
-/* Helper to determine whether date checks should be bypassed.
-   Set environment variable ES_ALLOW_PAST (any value) to bypass checks. */
-/* (previously had an ES_ALLOW_PAST toggle; date checks are now permanent)
-   No helper required. */
-
-/* ========== FILE PERSISTENCE FUNCTIONS ========== */
-
-/* Create directory if it doesn't exist */
-static int ensure_dir(const char *path) {
-    struct stat st = {0};
-    if (stat(path, &st) == -1) {
-        if (mkdir(path, 0700) == -1) {
+int write_all(int fd, const char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t n = write(fd, buf, len);
+        if (n == -1) {
+            if (errno == EINTR) continue;
             return -1;
         }
+        buf += n;
+        len -= (size_t)n;
     }
     return 0;
 }
 
-/* Initialize directory structure */
-static int init_storage(void) {
-    if (ensure_dir(BASE_DIR) == -1) return -1;
-    if (ensure_dir(USERS_DIR) == -1) return -1;
-    if (ensure_dir(EVENTS_DIR) == -1) return -1;
-    return 0;
+/* Sends a short reply such as "RCL OK\n" and records its status word. */
+static int reply_status(int fd, const char *command, const char *status, char out[8]) {
+    char line[32];
+    int n = snprintf(line, sizeof line, "%s %s\n", command, status);
+    snprintf(out, 8, "%s", status);
+    return write_all(fd, line, (size_t)n);
 }
 
-/* Save user password */
-static int save_user_password(const char *uid, const char *password) {
-    char user_dir[PATH_MAX];
-    char pass_file[PATH_MAX];
-    char created_dir[PATH_MAX];
-    char reserved_dir[PATH_MAX];
-    
-    snprintf(user_dir, sizeof user_dir, "%s/%.6s", USERS_DIR, uid);
-    if (ensure_dir(user_dir) == -1) return -1;
-    
-    /* Create CREATED and RESERVED subdirectories */
-    snprintf(created_dir, sizeof created_dir, "%s/%.6s/CREATED", USERS_DIR, uid);
-    snprintf(reserved_dir, sizeof reserved_dir, "%s/%.6s/RESERVED", USERS_DIR, uid);
-    ensure_dir(created_dir);
-    ensure_dir(reserved_dir);
-    
-    snprintf(pass_file, sizeof pass_file, "%s/%.6s/%.6s_pass.txt", USERS_DIR, uid, uid);
-    FILE *f = fopen(pass_file, "w");
-    if (!f) return -1;
-    fprintf(f, "%s\n", password);
-    fclose(f);
-    return 0;
+/* ========================================================================
+ * UDP handlers
+ * ==================================================================== */
+
+static size_t udp_status(char *reply, const char *command, const char *status) {
+    return (size_t)snprintf(reply, UDP_REPLY_MAX, "%s %s\n", command, status);
 }
 
-/* Load user password */
-static int load_user_password(const char *uid, char *password, size_t max_len) {
-    char pass_file[PATH_MAX];
-    snprintf(pass_file, sizeof pass_file, "%s/%.6s/%.6s_pass.txt", USERS_DIR, uid, uid);
-    
-    FILE *f = fopen(pass_file, "r");
-    if (!f) return -1;
-    
-    if (fgets(password, max_len, f) == NULL) {
-        fclose(f);
-        return -1;
+/* LIN UID password -> RLI OK | RLI NOK | RLI REG */
+size_t cmd_lin(char *reply, const char *uid, const char *password) {
+    User u;
+    size_t len;
+
+    if (storage_lock(1) == -1) return udp_status(reply, "RLI", "NOK");
+
+    if (user_load(uid, &u) == -1) {
+        /* Unknown UID: this is the user's first login, so register them. */
+        if (user_register(uid, password) == -1 || user_set_login(uid, 1) == -1)
+            len = udp_status(reply, "RLI", "NOK");
+        else
+            len = udp_status(reply, "RLI", "REG");
+    } else if (strcmp(u.password, password) != 0) {
+        len = udp_status(reply, "RLI", "NOK");
+    } else if (user_set_login(uid, 1) == -1) {
+        len = udp_status(reply, "RLI", "NOK");
+    } else {
+        len = udp_status(reply, "RLI", "OK");
     }
-    
-    /* Remove newline */
-    size_t len = strlen(password);
-    if (len > 0 && password[len-1] == '\n') password[len-1] = '\0';
-    
-    fclose(f);
-    return 0;
-}
 
-/* Create login marker */
-static int mark_user_logged_in(const char *uid) {
-    char login_file[PATH_MAX];
-    snprintf(login_file, sizeof login_file, "%s/%.6s/%.6s_login.txt", USERS_DIR, uid, uid);
-    
-    FILE *f = fopen(login_file, "w");
-    if (!f) return -1;
-    fprintf(f, "logged_in\n");
-    fclose(f);
-    return 0;
-}
-
-/* Remove login marker */
-static int mark_user_logged_out(const char *uid) {
-    char login_file[PATH_MAX];
-    snprintf(login_file, sizeof login_file, "%s/%.6s/%.6s_login.txt", USERS_DIR, uid, uid);
-    unlink(login_file);  /* Remove file */
-    return 0;
-}
-
-/* Delete user password (for unregister) */
-static int delete_user_password(const char *uid) {
-    char pass_file[PATH_MAX];
-    snprintf(pass_file, sizeof pass_file, "%s/%.6s/%.6s_pass.txt", USERS_DIR, uid, uid);
-    unlink(pass_file);
-    
-    char login_file[PATH_MAX];
-    snprintf(login_file, sizeof login_file, "%s/%.6s/%.6s_login.txt", USERS_DIR, uid, uid);
-    unlink(login_file);
-    
-    return 0;
-}
-
-/* Save event to START file */
-static int save_event_start(const Event *ev) {
-    char event_dir[PATH_MAX];
-    char start_file[PATH_MAX];
-    char desc_dir[PATH_MAX];
-    char desc_file[PATH_MAX];
-    char res_file[PATH_MAX];
-    char res_dir[PATH_MAX];
-    char user_created[PATH_MAX];
-    char created_file[PATH_MAX];
-    
-    snprintf(event_dir, sizeof event_dir, "%s/%03d", EVENTS_DIR, ev->eid);
-    if (ensure_dir(event_dir) == -1) return -1;
-    
-    /* Save START file */
-    snprintf(start_file, sizeof start_file, "%s/%03d/START_%03d.txt", EVENTS_DIR, ev->eid, ev->eid);
-    FILE *f = fopen(start_file, "w");
-    if (!f) return -1;
-    fprintf(f, "%s %s %s %d %s\n", ev->owner, ev->name, ev->fname, ev->attendance_size, ev->event_date);
-    fclose(f);
-    
-    /* Save RES file (initially 0) */
-    snprintf(res_file, sizeof res_file, "%s/%03d/RES_%03d.txt", EVENTS_DIR, ev->eid, ev->eid);
-    f = fopen(res_file, "w");
-    if (!f) return -1;
-    fprintf(f, "%d\n", ev->seats_reserved);
-    fclose(f);
-    
-    /* Create DESCRIPTION dir and save file */
-    snprintf(desc_dir, sizeof desc_dir, "%s/%03d/DESCRIPTION", EVENTS_DIR, ev->eid);
-    if (ensure_dir(desc_dir) == -1) return -1;
-    
-    snprintf(desc_file, sizeof desc_file, "%s/%03d/DESCRIPTION/%.24s", EVENTS_DIR, ev->eid, ev->fname);
-    f = fopen(desc_file, "wb");
-    if (!f) return -1;
-    if (ev->fsize > 0 && ev->fdata) {
-        fwrite(ev->fdata, 1, ev->fsize, f);
-    }
-    fclose(f);
-    
-    /* Create RESERVATIONS dir */
-    snprintf(res_dir, sizeof res_dir, "%s/%03d/RESERVATIONS", EVENTS_DIR, ev->eid);
-    ensure_dir(res_dir);
-    
-    /* Add to user's CREATED dir */
-    snprintf(user_created, sizeof user_created, "%s/%.6s/CREATED", USERS_DIR, ev->owner);
-    ensure_dir(user_created);
-    snprintf(created_file, sizeof created_file, "%s/%.6s/CREATED/%03d.txt", USERS_DIR, ev->owner, ev->eid);
-    f = fopen(created_file, "w");
-    if (f) {
-        fprintf(f, "%03d\n", ev->eid);
-        fclose(f);
-    }
-    
-    return 0;
-}
-
-/* Update RES file */
-static int update_event_reservations(int eid, int total_reserved) {
-    char res_file[PATH_MAX];
-    snprintf(res_file, sizeof res_file, "%s/%03d/RES_%03d.txt", EVENTS_DIR, eid, eid);
-    
-    FILE *f = fopen(res_file, "w");
-    if (!f) return -1;
-    fprintf(f, "%d\n", total_reserved);
-    fclose(f);
-    return 0;
-}
-
-/* Save reservation */
-static int save_reservation(const Reservation *r) {
-    /* Format: R-UID-YYYY-MM-DD-HHMMSS.txt */
-    char timestamp_file[256];
-    
-    /* Convert timestamp dd-mm-yyyy hh:mm:ss to YYYY-MM-DD HHMMSS */
-    /* timestamp format: dd-mm-yyyy hh:mm:ss (19 chars) */
-    if (strlen(r->timestamp) < 19) return -1;
-    
-    char yyyy[5], mm[3], dd[3], hh[3], min[3], ss[3];
-    strncpy(dd, r->timestamp + 0, 2); dd[2] = '\0';
-    strncpy(mm, r->timestamp + 3, 2); mm[2] = '\0';
-    strncpy(yyyy, r->timestamp + 6, 4); yyyy[4] = '\0';
-    strncpy(hh, r->timestamp + 11, 2); hh[2] = '\0';
-    strncpy(min, r->timestamp + 14, 2); min[2] = '\0';
-    strncpy(ss, r->timestamp + 17, 2); ss[2] = '\0';
-    
-    snprintf(timestamp_file, sizeof timestamp_file, "R-%s-%s%s%s_%s%s%s.txt",
-             r->uid, yyyy, mm, dd, hh, min, ss);
-    
-    /* Save to event RESERVATIONS dir */
-    char event_res_file[PATH_MAX];
-    snprintf(event_res_file, sizeof event_res_file, "%s/%03d/RESERVATIONS/%s",
-             EVENTS_DIR, r->eid, timestamp_file);
-    
-    FILE *f = fopen(event_res_file, "w");
-    if (!f) return -1;
-    fprintf(f, "%s %d %s\n", r->uid, r->people, r->timestamp);
-    fclose(f);
-    
-    /* Save to user RESERVED dir */
-    char user_reserved_dir[PATH_MAX];
-    char user_res_file[PATH_MAX];
-    snprintf(user_reserved_dir, sizeof user_reserved_dir, "%s/%.6s/RESERVED", USERS_DIR, r->uid);
-    ensure_dir(user_reserved_dir);
-    
-    snprintf(user_res_file, sizeof user_res_file, "%s/%.6s/RESERVED/%s", USERS_DIR, r->uid, timestamp_file);
-    f = fopen(user_res_file, "w");
-    if (!f) return 0;  /* Not critical if user copy fails */
-    fprintf(f, "%s %d %s\n", r->uid, r->people, r->timestamp);
-    fclose(f);
-    
-    return 0;
-}
-
-/* Close event (create END file) */
-static int close_event_file(int eid) {
-    char end_file[PATH_MAX];
-    char timestamp[20];
-    
-    get_current_timestamp(timestamp);
-    
-    snprintf(end_file, sizeof end_file, "%s/%03d/END_%03d.txt", EVENTS_DIR, eid, eid);
-    FILE *f = fopen(end_file, "w");
-    if (!f) return -1;
-    fprintf(f, "%s\n", timestamp);
-    fclose(f);
-    return 0;
-}
-
-/* Load all events from disk on startup */
-static int load_events_from_disk(void) {
-    DIR *events_dir = opendir(EVENTS_DIR);
-    if (!events_dir) return 0;  /* No events yet */
-    
-    struct dirent *entry;
-    while ((entry = readdir(events_dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        
-        int eid = atoi(entry->d_name);
-        if (eid <= 0 || eid > 999) continue;
-        
-        /* Read START file */
-        char start_file[PATH_MAX];
-        snprintf(start_file, sizeof start_file, "%s/%03d/START_%03d.txt", EVENTS_DIR, eid, eid);
-        
-        FILE *f = fopen(start_file, "r");
-        if (!f) continue;
-        
-        Event *ev = create_event_slot();
-        if (!ev) { fclose(f); continue; }
-        
-        ev->eid = eid;
-        if (eid >= next_eid) next_eid = eid + 1;
-        
-        char owner[8], name[16], fname[32], date[32];
-        int attendance;
-        if (fscanf(f, "%7s %15s %31s %d %31[^\n]", owner, name, fname, &attendance, date) == 5) {
-            strncpy(ev->owner, owner, 6); ev->owner[6] = '\0';
-            strncpy(ev->name, name, 10); ev->name[10] = '\0';
-            strncpy(ev->fname, fname, MAX_FILENAME_LEN); ev->fname[MAX_FILENAME_LEN] = '\0';
-            strncpy(ev->event_date, date, 16); ev->event_date[16] = '\0';
-            ev->attendance_size = attendance;
-        }
-        fclose(f);
-        
-        /* Read RES file */
-        char res_file[PATH_MAX];
-        snprintf(res_file, sizeof res_file, "%s/%03d/RES_%03d.txt", EVENTS_DIR, eid, eid);
-        f = fopen(res_file, "r");
-        if (f) {
-            fscanf(f, "%d", &ev->seats_reserved);
-            fclose(f);
-        }
-        
-        /* Check if closed */
-        char end_file[PATH_MAX];
-        snprintf(end_file, sizeof end_file, "%s/%03d/END_%03d.txt", EVENTS_DIR, eid, eid);
-        ev->closed = (access(end_file, F_OK) == 0) ? 1 : 0;
-        
-        /* Load file data */
-        char desc_file[PATH_MAX];
-        snprintf(desc_file, sizeof desc_file, "%s/%03d/DESCRIPTION/%s", EVENTS_DIR, eid, ev->fname);
-        f = fopen(desc_file, "rb");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            ev->fsize = ftell(f);
-            rewind(f);
-            if (ev->fsize > 0 && ev->fsize <= MAX_FDATA_SIZE) {
-                ev->fdata = malloc(ev->fsize);
-                if (ev->fdata) {
-                    fread(ev->fdata, 1, ev->fsize, f);
-                }
-            }
-            fclose(f);
-        }
-    }
-    
-    closedir(events_dir);
-    return 0;
-}
-
-/* Load all users from disk on startup */
-static int load_users_from_disk(void) {
-    DIR *users_dir = opendir(USERS_DIR);
-    if (!users_dir) return 0;
-    
-    struct dirent *entry;
-    while ((entry = readdir(users_dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        if (strlen(entry->d_name) != 6) continue;
-        
-        const char *uid = entry->d_name;
-        
-        /* Check if password file exists */
-        char pass_file[PATH_MAX];
-        snprintf(pass_file, sizeof pass_file, "%s/%.6s/%.6s_pass.txt", USERS_DIR, uid, uid);
-        
-        FILE *f = fopen(pass_file, "r");
-        if (!f) continue;  /* User unregistered */
-        
-        /* Find or create user slot */
-        User *u = find_user(uid);
-        if (!u) {
-            /* Create new user node */
-            UserNode *new_node = malloc(sizeof(UserNode));
-            if (!new_node) {
-                fclose(f);
-                continue;
-            }
-            memset(&new_node->data, 0, sizeof(User));
-            new_node->data.used = 1;
-            strncpy(new_node->data.uid, uid, 6);
-            new_node->data.uid[6] = '\0';
-            
-            new_node->next = users_head;
-            users_head = new_node;
-            u = &new_node->data;
-        }
-        
-        if (u) {
-            char password[128];
-            if (fgets(password, sizeof password, f)) {
-                size_t len = strlen(password);
-                if (len > 0 && password[len-1] == '\n') password[len-1] = '\0';
-                strncpy(u->password, password, 127);
-                u->password[127] = '\0';
-            }
-            
-            /* Check if logged in (login file exists) */
-            char login_file[PATH_MAX];
-            snprintf(login_file, sizeof login_file, "%s/%.6s/%.6s_login.txt", USERS_DIR, uid, uid);
-            u->logged_in = (access(login_file, F_OK) == 0) ? 1 : 0;
-        }
-        
-        fclose(f);
-    }
-    
-    closedir(users_dir);
-    return 0;
-}
-
-/* Initialize persistence system and load data */
-int init_persistence(void) {
-    if (init_storage() == -1) {
-        fprintf(stderr, "Failed to initialize storage directories\n");
-        return -1;
-    }
-    
-    load_users_from_disk();
-    load_events_from_disk();
-    
-    printf("Persistence system initialized. Loaded users and events from disk.\n");
-    return 0;
-}
-
-/* ========== END FILE PERSISTENCE FUNCTIONS ========== */
-
-/* ---------- UDP command handlers ---------- */
-
-/* LIN UID password -> replies: RLI OK | RLI NOK | RLI REG */
-int cmd_lin(char *response, const char *uid, const char *password) {
-    if (!response || !uid || !password) return 1;
-    
-    /* First check if user exists in memory */
-    User *u = find_user(uid);
-    
-    if (!u) {
-        /* Check if user exists on disk (previously registered) */
-        char saved_password[128];
-        if (load_user_password(uid, saved_password, sizeof saved_password) == 0) {
-            /* User exists on disk but not in memory - re-login */
-            if (strcmp(saved_password, password) != 0) {
-                sprintf(response, "RLI NOK\n");
-                return 0;
-            }
-            
-            /* Create user in memory */
-            UserNode *new_node = malloc(sizeof(UserNode));
-            if (!new_node) {
-                sprintf(response, "RLI NOK\n");
-                return 0;
-            }
-            memset(&new_node->data, 0, sizeof(User));
-            new_node->data.used = 1;
-            strncpy(new_node->data.uid, uid, 6); new_node->data.uid[6] = '\0';
-            strncpy(new_node->data.password, password, sizeof(new_node->data.password)-1);
-            new_node->data.logged_in = 1;
-            
-            new_node->next = users_head;
-            users_head = new_node;
-            
-            mark_user_logged_in(uid);
-            sprintf(response, "RLI OK\n");
-            return 0;
-        }
-        
-        /* New user - register and login */
-        UserNode *new_node = malloc(sizeof(UserNode));
-        if (!new_node) {
-            sprintf(response, "RLI NOK\n");
-            return 0;
-        }
-        memset(&new_node->data, 0, sizeof(User));
-        new_node->data.used = 1;
-        strncpy(new_node->data.uid, uid, 6); new_node->data.uid[6] = '\0';
-        strncpy(new_node->data.password, password, sizeof(new_node->data.password)-1);
-        new_node->data.logged_in = 1;
-        
-        new_node->next = users_head;
-        users_head = new_node;
-        
-        /* Save to disk */
-        save_user_password(uid, password);
-        mark_user_logged_in(uid);
-        
-        sprintf(response, "RLI REG\n");
-        return 0;
-    }
-    
-    /* user exists in memory */
-    if (strcmp(u->password, password) != 0) {
-        sprintf(response, "RLI NOK\n");
-        return 0;
-    }
-    u->logged_in = 1;
-    mark_user_logged_in(uid);
-    sprintf(response, "RLI OK\n");
-    return 0;
+    storage_unlock();
+    return len;
 }
 
 /* LOU UID password -> RLO OK | RLO NOK | RLO UNR | RLO WRP */
-int cmd_lou(char *response, const char *uid, const char *password) {
-    if (!response || !uid || !password) return 1;
-    User *u = find_user(uid);
-    if (!u) {
-        sprintf(response, "RLO UNR\n");
-        return 0;
-    }
-    if (strcmp(u->password, password) != 0) {
-        sprintf(response, "RLO WRP\n");
-        return 0;
-    }
-    if (u->logged_in) {
-        u->logged_in = 0;
-        mark_user_logged_out(uid);
-        sprintf(response, "RLO OK\n");
-    } else {
-        sprintf(response, "RLO NOK\n");
-    }
-    return 0;
+size_t cmd_lou(char *reply, const char *uid, const char *password) {
+    User u;
+    size_t len;
+
+    if (storage_lock(1) == -1) return udp_status(reply, "RLO", "NOK");
+
+    if (user_load(uid, &u) == -1)                     len = udp_status(reply, "RLO", "UNR");
+    else if (strcmp(u.password, password) != 0)       len = udp_status(reply, "RLO", "WRP");
+    else if (!u.logged_in)                            len = udp_status(reply, "RLO", "NOK");
+    else if (user_set_login(uid, 0) == -1)            len = udp_status(reply, "RLO", "NOK");
+    else                                              len = udp_status(reply, "RLO", "OK");
+
+    storage_unlock();
+    return len;
 }
 
 /* UNR UID password -> RUR OK | RUR NOK | RUR UNR | RUR WRP */
-int cmd_unr(char *response, const char *uid, const char *password) {
-    if (!response || !uid || !password) return 1;
-    User *u = find_user(uid);
-    if (!u) {
-        sprintf(response, "RUR UNR\n");
-        return 0;
-    }
-    if (strcmp(u->password, password) != 0) {
-        sprintf(response, "RUR WRP\n");
-        return 0;
-    }
-    if (!u->logged_in) {
-        sprintf(response, "RUR NOK\n");
-        return 0;
-    }
-    
-    /* Delete password and login files, but preserve CREATED/RESERVED dirs */
-    delete_user_password(uid);
-    
-    /* Remove from memory */
-    u->used = 0;
-    u->logged_in = 0;
-    sprintf(response, "RUR OK\n");
-    return 0;
+size_t cmd_unr(char *reply, const char *uid, const char *password) {
+    User u;
+    size_t len;
+
+    if (storage_lock(1) == -1) return udp_status(reply, "RUR", "NOK");
+
+    if (user_load(uid, &u) == -1)                     len = udp_status(reply, "RUR", "UNR");
+    else if (strcmp(u.password, password) != 0)       len = udp_status(reply, "RUR", "WRP");
+    else if (!u.logged_in)                            len = udp_status(reply, "RUR", "NOK");
+    else if (user_unregister(uid) == -1)              len = udp_status(reply, "RUR", "NOK");
+    else                                              len = udp_status(reply, "RUR", "OK");
+
+    storage_unlock();
+    return len;
 }
 
-/* LME UID password -> RME status [EID state]* */
-int cmd_lme(char *response, const char *uid, const char *password) {
-    if (!response || !uid || !password) return 1;
-    User *u = find_user(uid);
-    if (!u) {
-        sprintf(response, "RME NOK\n");
-        return 0;
+/* LME UID password -> RME status[ EID state]* */
+size_t cmd_lme(char *reply, const char *uid, const char *password) {
+    User u;
+    Event *events = NULL;
+    int count = 0, i;
+    size_t len;
+
+    if (storage_lock(0) == -1) return udp_status(reply, "RME", "NOK");
+
+    if (user_load(uid, &u) == -1)                { len = udp_status(reply, "RME", "NOK"); goto done; }
+    if (strcmp(u.password, password) != 0)       { len = udp_status(reply, "RME", "WRP"); goto done; }
+    if (!u.logged_in)                            { len = udp_status(reply, "RME", "NLG"); goto done; }
+
+    if (event_list_by_owner(uid, &events, &count) == -1 || count == 0) {
+        len = udp_status(reply, "RME", "NOK");
+        goto done;
     }
-    if (strcmp(u->password, password) != 0) {
-        sprintf(response, "RME WRP\n");
-        return 0;
+
+    len = (size_t)snprintf(reply, UDP_REPLY_MAX, "RME OK");
+    for (i = 0; i < count; i++) {
+        int written = snprintf(reply + len, UDP_REPLY_MAX - len, " %03d %d",
+                               events[i].eid, event_state(&events[i]));
+        if (written < 0 || (size_t)written >= UDP_REPLY_MAX - len - 1) break;
+        len += (size_t)written;
     }
-    if (!u->logged_in) {
-        sprintf(response, "RME NLG\n");
-        return 0;
-    }
-    /* collect events owned by this user */
-    char tmp[UDP_RESPONSE_MAX];
-    tmp[0] = '\0';
-    int count = 0;
-    
-    EventNode *curr = events_head;
-    while (curr) {
-        if (curr->data.used && strcmp(curr->data.owner, uid) == 0) {
-            int state = 1; /* default future open */
-            if (curr->data.closed) state = 3;
-            else if (curr->data.seats_reserved >= curr->data.attendance_size) state = 2;
-            else {
-                /* compare date to current */
-                char current_dt[17];
-                get_current_datetime(current_dt);
-                if (cmp_date(curr->data.event_date, current_dt) < 0) state = 0;
-                else state = 1;
-            }
-            char part[64];
-            snprintf(part, sizeof part, " %03d %d", curr->data.eid, state);
-            strncat(tmp, part, sizeof tmp - strlen(tmp) - 1);
-            count++;
-        }
-        curr = curr->next;
-    }
-    
-    if (count == 0) {
-        sprintf(response, "RME NOK\n");
-        return 0;
-    }
-    /* Compose response safely within UDP_RESPONSE_MAX */
-    size_t used = (size_t)snprintf(response, UDP_RESPONSE_MAX, "RME OK");
-    if (used >= UDP_RESPONSE_MAX) {
-        response[UDP_RESPONSE_MAX - 1] = '\0';
-        return 0;
-    }
-    size_t tmp_len = strlen(tmp);
-    size_t avail = (UDP_RESPONSE_MAX - 1) - used; /* leave room for NUL */
-    if (tmp_len > avail) tmp_len = avail;
-    memcpy(response + used, tmp, tmp_len);
-    used += tmp_len;
-    if (used < UDP_RESPONSE_MAX - 1) {
-        response[used++] = '\n';
-    }
-    response[used] = '\0';
-    return 0;
+    reply[len++] = '\n';
+    reply[len] = '\0';
+
+done:
+    free(events);
+    storage_unlock();
+    return len;
 }
 
-/* LMR UID password -> RMR status [EID date value]*
-   Returns up to 50 most recent reservations with timestamp in dd-mm-yyyy hh:mm:ss format
-*/
-int cmd_lmr(char *response, const char *uid, const char *password) {
-    if (!response || !uid || !password) return 1;
-    User *u = find_user(uid);
-    if (!u) {
-        sprintf(response, "RMR NOK\n");
-        return 0;
+/* LMR UID password -> RMR status[ EID date value]*, newest 50 reservations */
+size_t cmd_lmr(char *reply, const char *uid, const char *password) {
+    User u;
+    Reservation *list = NULL;
+    int count = 0, i;
+    size_t len;
+
+    if (storage_lock(0) == -1) return udp_status(reply, "RMR", "NOK");
+
+    if (user_load(uid, &u) == -1)                { len = udp_status(reply, "RMR", "NOK"); goto done; }
+    if (strcmp(u.password, password) != 0)       { len = udp_status(reply, "RMR", "WRP"); goto done; }
+    if (!u.logged_in)                            { len = udp_status(reply, "RMR", "NLG"); goto done; }
+
+    if (reservation_list_by_user(uid, &list, &count, RESERVATIONS_LISTED_MAX) == -1 || count == 0) {
+        len = udp_status(reply, "RMR", "NOK");
+        goto done;
     }
-    if (strcmp(u->password, password) != 0) {
-        sprintf(response, "RMR WRP\n");
-        return 0;
+
+    len = (size_t)snprintf(reply, UDP_REPLY_MAX, "RMR OK");
+    for (i = 0; i < count; i++) {
+        int written = snprintf(reply + len, UDP_REPLY_MAX - len, " %03d %s %d",
+                               list[i].eid, list[i].timestamp, list[i].people);
+        if (written < 0 || (size_t)written >= UDP_REPLY_MAX - len - 1) break;
+        len += (size_t)written;
     }
-    if (!u->logged_in) {
-        sprintf(response, "RMR NLG\n");
-        return 0;
-    }
-    
-    /* Collect all reservations for this user */
-    typedef struct {
-        int eid;
-        char timestamp[20];
-        int people;
-    } ResInfo;
-    
-    /* Allocate space for reservations - we'll store all and then take last 50 */
-    ResInfo *res_list = NULL;
-    int res_count = 0;
-    int res_capacity = 0;
-    
-    ReservationNode *curr = reservations_head;
-    while (curr) {
-        if (curr->data.used && strcmp(curr->data.uid, uid) == 0) {
-            /* Find the corresponding event */
-            Event *ev = NULL;
-            EventNode *ev_curr = events_head;
-            while (ev_curr) {
-                if (ev_curr->data.used && ev_curr->data.eid == curr->data.eid) {
-                    ev = &ev_curr->data;
-                    break;
-                }
-                ev_curr = ev_curr->next;
-            }
-            
-            if (ev) {
-                /* Expand array if needed */
-                if (res_count >= res_capacity) {
-                    res_capacity = (res_capacity == 0) ? 10 : res_capacity * 2;
-                    res_list = realloc(res_list, res_capacity * sizeof(ResInfo));
-                    if (!res_list) {
-                        sprintf(response, "RMR NOK\n");
-                        return 0;
-                    }
-                }
-                
-                res_list[res_count].eid = ev->eid;
-                strncpy(res_list[res_count].timestamp, curr->data.timestamp, 19);
-                res_list[res_count].timestamp[19] = '\0';
-                res_list[res_count].people = curr->data.people;
-                res_count++;
-            }
-        }
-        curr = curr->next;
-    }
-    
-    if (res_count == 0) {
-        sprintf(response, "RMR NOK\n");
-        return 0;
-    }
-    
-    /* Take last 50 reservations maximum (most recent) */
-    int start_idx = (res_count > MAX_MYRESERVATIONS_DISPLAY) ? (res_count - MAX_MYRESERVATIONS_DISPLAY) : 0;
-    
-    /* Build reply directly into the provided UDP response buffer (which is 2048 bytes). */
-    size_t used = (size_t)snprintf(response, UDP_RESPONSE_MAX, "RMR OK");
-    if (used >= UDP_RESPONSE_MAX) {
-        response[UDP_RESPONSE_MAX - 1] = '\0';
-        free(res_list);
-        return 0;
-    }
-    for (int i = start_idx; i < res_count; ++i) {
-        size_t remain = UDP_RESPONSE_MAX - used;
-        if (remain <= 2) break; /* keep space for at least '\n' + '\0' */
-        int w = snprintf(response + used, remain, " %03d %s %d",
-                         res_list[i].eid, res_list[i].timestamp, res_list[i].people);
-        if (w < 0) break;
-        if ((size_t)w >= remain) {
-            /* truncated: stop appending */
-            used = UDP_RESPONSE_MAX - 1;
-            response[used] = '\0';
-            break;
-        }
-        used += (size_t)w;
-    }
-    if (used < UDP_RESPONSE_MAX - 1) response[used++] = '\n';
-    response[used] = '\0';
-    free(res_list);
-    return 0;
+    reply[len++] = '\n';
+    reply[len] = '\0';
+
+done:
+    free(list);
+    storage_unlock();
+    return len;
 }
 
-/* ---------- TCP command handlers ---------- */
+/* ========================================================================
+ * TCP handlers
+ * ==================================================================== */
 
-/* cmd_cre: creates event, stores file on server, returns "RCE OK EID\n" or error codes.
-   signature: int cmd_cre(char **response_buf, size_t *response_len, const char *uid, const char *password,
-                         const char *name, const char *event_date, int attendance_size,
-                         const char *fname, int fsize, const char *fdata);
-*/
-int cmd_cre(char **response_buf, size_t *response_len, const char *uid, const char *password,
-            const char *name, const char *event_date, int attendance_size, const char *fname,
-            int fsize, const char *fdata)
-{
-    if (!response_buf || !response_len || !uid || !password || !name || !event_date || !fname) return 1;
+/* CRE ... -> RCE OK EID | RCE NOK | RCE NLG | RCE WRP
+   `staged_path` is the temporary file the upload was streamed into; it is
+   moved into the event directory on success and removed otherwise. */
+int cmd_cre(int fd, const char *uid, const char *password, const char *name,
+            const char *event_date, int attendance_size, const char *fname,
+            const char *staged_path, char status[8]) {
+    User u;
+    Event ev;
+    char now[EVENT_DATE_LEN + 1], line[32];
+    int eid, rc, n;
 
-    User *u = find_user(uid);
-    if (!u) {
-        /* not registered or bad user -> NLG? Spec: if user not logged in reply NLG. For not registered, WRP? We'll reply NLG for simplicity */
-        *response_buf = strdup("RCE NLG\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    if (strcmp(u->password, password) != 0) {
-        *response_buf = strdup("RCE WRP\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    if (!u->logged_in) {
-        *response_buf = strdup("RCE NLG\n");
-        *response_len = strlen(*response_buf);
-        return 0;
+    if (storage_lock(1) == -1) {
+        unlink(staged_path);
+        return reply_status(fd, "RCE", "NOK", status);
     }
 
-    /* Reject creation of events scheduled before current date/time. */
-    
-    char current_dt[17];
-    get_current_datetime(current_dt);
-    if (cmp_date(event_date, current_dt) < 0) {
-        *response_buf = strdup("RCE NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    
-    /* create event slot */
-    Event *ev = create_event_slot();
-    if (!ev) {
-        *response_buf = strdup("RCE NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    ev->eid = ev->eid; /* assigned in create_event_slot */
-    strncpy(ev->owner, uid, 6); ev->owner[6] = '\0';
-    strncpy(ev->name, name, sizeof ev->name - 1);
-    strncpy(ev->event_date, event_date, sizeof ev->event_date - 1);
-    ev->attendance_size = attendance_size;
-    ev->seats_reserved = 0;
-    strncpy(ev->fname, fname, sizeof ev->fname - 1);
-    ev->fsize = fsize;
-    if (fsize > 0) {
-        if (fsize > MAX_FDATA_SIZE) {
-            free_event(ev);
-            *response_buf = strdup("RCE NOK\n");
-            *response_len = strlen(*response_buf);
-            return 0;
-        }
-        ev->fdata = malloc(fsize);
-        if (!ev->fdata) {
-            free_event(ev);
-            *response_buf = strdup("RCE NOK\n");
-            *response_len = strlen(*response_buf);
-            return 0;
-        }
-        memcpy(ev->fdata, fdata, fsize);
-    } else {
-        ev->fdata = NULL;
-    }
+    if (user_load(uid, &u) == -1)          { rc = reply_status(fd, "RCE", "NLG", status); goto done; }
+    if (strcmp(u.password, password) != 0) { rc = reply_status(fd, "RCE", "WRP", status); goto done; }
+    if (!u.logged_in)                      { rc = reply_status(fd, "RCE", "NLG", status); goto done; }
 
-    /* success: return OK + EID as 3 digits */
-    char tmp[64];
-    snprintf(tmp, sizeof tmp, "RCE OK %03d\n", ev->eid);
-    *response_buf = strdup(tmp);
-    *response_len = strlen(tmp);
-    
-    /* Save event to disk */
-    save_event_start(ev);
-    
-    return 0;
+    /* An event cannot be scheduled for an instant that already passed. */
+    now_datetime(now);
+    if (date_cmp(event_date, now) < 0)     { rc = reply_status(fd, "RCE", "NOK", status); goto done; }
+
+    eid = event_next_eid();
+    if (eid == -1)                         { rc = reply_status(fd, "RCE", "NOK", status); goto done; }
+
+    memset(&ev, 0, sizeof ev);
+    ev.eid = eid;
+    snprintf(ev.owner, sizeof ev.owner, "%s", uid);
+    snprintf(ev.name, sizeof ev.name, "%s", name);
+    snprintf(ev.event_date, sizeof ev.event_date, "%s", event_date);
+    snprintf(ev.fname, sizeof ev.fname, "%s", fname);
+    ev.attendance_size = attendance_size;
+    ev.seats_reserved = 0;
+
+    if (event_create(&ev, staged_path) == -1) { rc = reply_status(fd, "RCE", "NOK", status); goto done; }
+
+    snprintf(status, 8, "OK");
+    n = snprintf(line, sizeof line, "RCE OK %03d\n", eid);
+    rc = write_all(fd, line, (size_t)n);
+    storage_unlock();
+    return rc;
+
+done:
+    unlink(staged_path);                  /* the upload was refused */
+    storage_unlock();
+    return rc;
 }
 
-/* cmd_cls: close event
-   signature: int cmd_cls(char **response_buf, size_t *response_len, const char *uid, const char *password, const char *eid);
-*/
-int cmd_cls(char **response_buf, size_t *response_len, const char *uid, const char *password, const char *eidstr) {
-    if (!response_buf || !response_len || !uid || !password || !eidstr) return 1;
-    User *u = find_user(uid);
-    if (!u) {
-        *response_buf = strdup("RCL NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    if (strcmp(u->password, password) != 0) {
-        *response_buf = strdup("RCL NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    if (!u->logged_in) {
-        *response_buf = strdup("RCL NLG\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    Event *ev = find_event_by_eid_str(eidstr);
-    if (!ev) {
-        *response_buf = strdup("RCL NOE\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    if (strcmp(ev->owner, uid) != 0) {
-        *response_buf = strdup("RCL EOW\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    /* check if sold out */
-    if (ev->seats_reserved >= ev->attendance_size) {
-        *response_buf = strdup("RCL SLD\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-        /* (Previously would reject if event date is in the past.)
-           Creation of past events is allowed; do not reject here. */
-    if (ev->closed) {
-        *response_buf = strdup("RCL CLO\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    /* close it */
-    ev->closed = 1;
-    close_event_file(ev->eid);
-    *response_buf = strdup("RCL OK\n");
-    *response_len = strlen(*response_buf);
-    return 0;
+/* CLS UID password EID -> RCL OK | NOK | NLG | NOE | EOW | SLD | PST | CLO */
+int cmd_cls(int fd, const char *uid, const char *password, const char *eidstr, char status[8]) {
+    User u;
+    Event ev;
+    char now[EVENT_DATE_LEN + 1];
+    int rc;
+
+    if (storage_lock(1) == -1) return reply_status(fd, "RCL", "NOK", status);
+
+    if (user_load(uid, &u) == -1)          { rc = reply_status(fd, "RCL", "NOK", status); goto done; }
+    if (strcmp(u.password, password) != 0) { rc = reply_status(fd, "RCL", "NOK", status); goto done; }
+    if (!u.logged_in)                      { rc = reply_status(fd, "RCL", "NLG", status); goto done; }
+
+    if (event_load(atoi(eidstr), &ev) == -1) { rc = reply_status(fd, "RCL", "NOE", status); goto done; }
+    if (strcmp(ev.owner, uid) != 0)          { rc = reply_status(fd, "RCL", "EOW", status); goto done; }
+    if (ev.closed)                           { rc = reply_status(fd, "RCL", "CLO", status); goto done; }
+
+    now_datetime(now);
+    if (date_cmp(ev.event_date, now) < 0)    { rc = reply_status(fd, "RCL", "PST", status); goto done; }
+    if (ev.seats_reserved >= ev.attendance_size) { rc = reply_status(fd, "RCL", "SLD", status); goto done; }
+
+    rc = (event_close(ev.eid) == -1) ? reply_status(fd, "RCL", "NOK", status)
+                                     : reply_status(fd, "RCL", "OK", status);
+
+done:
+    storage_unlock();
+    return rc;
 }
 
-/* cmd_lst: list events
-   signature: int cmd_lst(char **response_buf, size_t *response_len);
-   reply: RLS status[ EID name state event_date ]*
-*/
-int cmd_lst(char **response_buf, size_t *response_len) {
-    if (!response_buf || !response_len) return 1;
+/* LST -> RLS NOK | RLS OK[ EID name state event_date]* */
+int cmd_lst(int fd, char status[8]) {
+    Event *events = NULL;
+    int count = 0, i, rc;
+    char *out = NULL;
+    size_t len = 0, cap;
 
-    Event *event_array[1024];
-    int count = 0;
+    if (storage_lock(0) == -1) return reply_status(fd, "RLS", "NOK", status);
 
-    /* Collect events */
-    EventNode *curr = events_head;
-    while (curr) {
-        if (curr->data.used) {
-            event_array[count++] = &curr->data;
+    if (event_list_all(&events, &count) == -1) { rc = reply_status(fd, "RLS", "NOK", status); goto done; }
+    if (count == 0)                            { rc = reply_status(fd, "RLS", "NOK", status); goto done; }
+
+    /* "RLS OK" + at most 999 records of " EID name state date" + "\n". */
+    cap = 8 + (size_t)count * (EVENT_NAME_MAX + EVENT_DATE_LEN + 12) + 2;
+    out = malloc(cap);
+    if (!out) { rc = reply_status(fd, "RLS", "NOK", status); goto done; }
+
+    len = (size_t)snprintf(out, cap, "RLS OK");
+    for (i = 0; i < count; i++) {
+        int written = snprintf(out + len, cap - len, " %03d %s %d %s",
+                               events[i].eid, events[i].name, event_state(&events[i]),
+                               events[i].event_date);
+        /* `cap` is sized for the worst case, so this never trips; the guard is
+           here so that a future change to the record format cannot turn into
+           an overflow of the newline below. */
+        if (written < 0 || (size_t)written >= cap - len - 1) break;
+        len += (size_t)written;
+    }
+    out[len++] = '\n';
+
+    snprintf(status, 8, "OK");
+    rc = write_all(fd, out, len);
+
+done:
+    free(out);
+    free(events);
+    storage_unlock();
+    return rc;
+}
+
+/* SED EID -> RSE NOK | RSE OK UID name date size reserved Fname Fsize Fdata
+   The description file is streamed straight from disk, so a 10 MB attachment
+   never has to fit in a buffer. */
+int cmd_sed(int fd, const char *eidstr, char status[8]) {
+    Event ev;
+    char path[1024], header[256];
+    int desc_fd = -1, rc, hlen;
+    long remaining;
+
+    if (storage_lock(0) == -1) return reply_status(fd, "RSE", "NOK", status);
+
+    if (event_load(atoi(eidstr), &ev) == -1)              { rc = reply_status(fd, "RSE", "NOK", status); goto done; }
+    if (event_description_path(&ev, path, sizeof path))   { rc = reply_status(fd, "RSE", "NOK", status); goto done; }
+
+    desc_fd = open(path, O_RDONLY);
+    if (desc_fd == -1)                                    { rc = reply_status(fd, "RSE", "NOK", status); goto done; }
+
+    hlen = snprintf(header, sizeof header, "RSE OK %s %s %s %d %d %s %ld ",
+                    ev.owner, ev.name, ev.event_date, ev.attendance_size,
+                    ev.seats_reserved, ev.fname, ev.fsize);
+    rc = write_all(fd, header, (size_t)hlen);
+    if (rc == -1) goto done;
+
+    remaining = ev.fsize;
+    while (remaining > 0) {
+        char chunk[STREAM_CHUNK];
+        size_t want = remaining < (long)sizeof chunk ? (size_t)remaining : sizeof chunk;
+        ssize_t n = read(desc_fd, chunk, want);
+        if (n == -1) {
+            if (errno == EINTR) continue;
+            rc = -1;
+            goto done;
         }
-        curr = curr->next;
+        if (n == 0) break;                   /* the file shrank underneath us */
+        if (write_all(fd, chunk, (size_t)n) == -1) { rc = -1; goto done; }
+        remaining -= n;
     }
 
-    if (count == 0) {
-        *response_buf = strdup("RLS NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
+    snprintf(status, 8, "OK");
+    rc = write_all(fd, "\n", 1);
 
-    /* Sort by EID ascending */
-    for (int i = 0; i < count - 1; i++) {
-        for (int j = i + 1; j < count; j++) {
-            if (event_array[i]->eid > event_array[j]->eid) {
-                Event *tmp = event_array[i];
-                event_array[i] = event_array[j];
-                event_array[j] = tmp;
-            }
-        }
-    }
-
-    char tmp[8192];
-    tmp[0] = '\0';
-
-    for (int i = 0; i < count; i++) {
-        Event *ev = event_array[i];
-
-        int state;
-        char current_dt[17];
-        get_current_datetime(current_dt);
-
-        if (ev->closed) state = 3;
-        else if (ev->seats_reserved >= ev->attendance_size) state = 2;
-        else if (cmp_date(ev->event_date, current_dt) < 0) state = 0;
-        else state = 1;
-
-        char part[128];
-        snprintf(part, sizeof part, " %03d %s %d %s",
-                 ev->eid, ev->name, state, ev->event_date);
-
-        strncat(tmp, part, sizeof tmp - strlen(tmp) - 1);
-    }
-
-    char *out = malloc(strlen(tmp) + 8);
-    if (!out) return 1;
-
-    strcpy(out, "RLS OK");
-    strcat(out, tmp);
-    strcat(out, "\n");
-
-    *response_buf = out;
-    *response_len = strlen(out);
-    return 0;
+done:
+    if (desc_fd != -1) close(desc_fd);
+    storage_unlock();
+    return rc;
 }
 
-/* cmd_sed: show event + file
-   signature: int cmd_sed(char **response_buf, size_t *response_len, const char *eid);
-   reply: RSE status [UID name event_date attendance_size Seats_reserved Fname Fsize Fdata]
-*/
-int cmd_sed(char **response_buf, size_t *response_len, const char *eidstr) {
-    if (!response_buf || !response_len || !eidstr) return 1;
-    Event *ev = find_event_by_eid_str(eidstr);
-    if (!ev) {
-        *response_buf = strdup("RSE NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    /* build header with metadata then append file contents */
-    char header[512];
-    snprintf(header, sizeof header, "RSE OK %s %s %s %d %d %s %d ",
-             ev->owner, ev->name, ev->event_date, ev->attendance_size, ev->seats_reserved, ev->fname, ev->fsize);
-    size_t hlen = strlen(header);
-    size_t total = hlen + ev->fsize + 2;
-    char *out = malloc(total);
-    if (!out) return 1;
-    memcpy(out, header, hlen);
-    if (ev->fsize > 0 && ev->fdata) {
-        memcpy(out + hlen, ev->fdata, ev->fsize);
-        hlen += ev->fsize;
-    }
-    out[hlen] = '\n';
-    out[hlen+1] = '\0';
-    *response_buf = out;
-    *response_len = hlen + 1;
-    return 0;
-}
+/* RID UID password EID people -> RRI ACC | REJ n | CLS | SLD | PST | NLG | WRP | NOK */
+int cmd_rid(int fd, const char *uid, const char *password, const char *eidstr, int people,
+            char status[8]) {
+    User u;
+    Event ev;
+    Reservation r;
+    char now[EVENT_DATE_LEN + 1], line[32];
+    int remaining, rc;
 
-/* cmd_rid: reserve seats
-   signature: int cmd_rid(char **response_buf, size_t *response_len, const char *uid, const char *password, const char *eid, int people)
-   replies: RRI ACC | RRI REJ n_seats | RRI CLS | RRI SLD | RRI PST | RRI WRP | RRI NOK
-*/
-int cmd_rid(char **response_buf, size_t *response_len, const char *uid, const char *password, const char *eidstr, int people) {
-    if (!response_buf || !response_len || !uid || !password || !eidstr) return 1;
-    User *u = find_user(uid);
-    if (!u) {
-        *response_buf = strdup("RRI NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    if (strcmp(u->password, password) != 0) {
-        *response_buf = strdup("RRI WRP\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    if (!u->logged_in) {
-        *response_buf = strdup("RRI NLG\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    Event *ev = find_event_by_eid_str(eidstr);
-    if (!ev) {
-        *response_buf = strdup("RRI NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    /* (Previously would reject if event date is in the past.)
-       Reservation creation now allowed; do not reject here. */
-    /* closed */
-    if (ev->closed) {
-        *response_buf = strdup("RRI CLS\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    int remaining = ev->attendance_size - ev->seats_reserved;
-    if (remaining <= 0) {
-        *response_buf = strdup("RRI SLD\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
+    if (storage_lock(1) == -1) return reply_status(fd, "RRI", "NOK", status);
+
+    if (user_load(uid, &u) == -1)            { rc = reply_status(fd, "RRI", "NOK", status); goto done; }
+    if (strcmp(u.password, password) != 0)   { rc = reply_status(fd, "RRI", "WRP", status); goto done; }
+    if (!u.logged_in)                        { rc = reply_status(fd, "RRI", "NLG", status); goto done; }
+
+    if (event_load(atoi(eidstr), &ev) == -1) { rc = reply_status(fd, "RRI", "NOK", status); goto done; }
+    if (ev.closed)                           { rc = reply_status(fd, "RRI", "CLS", status); goto done; }
+
+    now_datetime(now);
+    if (date_cmp(ev.event_date, now) < 0)    { rc = reply_status(fd, "RRI", "PST", status); goto done; }
+
+    remaining = ev.attendance_size - ev.seats_reserved;
+    if (remaining <= 0)                      { rc = reply_status(fd, "RRI", "SLD", status); goto done; }
     if (people > remaining) {
-        char tmp[64];
-        snprintf(tmp, sizeof tmp, "RRI REJ %d\n", remaining);
-        *response_buf = strdup(tmp);
-        *response_len = strlen(*response_buf);
-        return 0;
+        int n = snprintf(line, sizeof line, "RRI REJ %d\n", remaining);
+        snprintf(status, 8, "REJ");
+        rc = write_all(fd, line, (size_t)n);
+        goto done;
     }
-    /* accept reservation */
-    ev->seats_reserved += people;
-    Reservation *r = create_reservation_slot();
-    if (!r) {
-        *response_buf = strdup("RRI NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
+
+    memset(&r, 0, sizeof r);
+    snprintf(r.uid, sizeof r.uid, "%s", uid);
+    r.eid = ev.eid;
+    r.people = people;
+    now_timestamp(r.timestamp);
+
+    /* Seat count and reservation record must land together; the exclusive lock
+       is what makes the pair atomic with respect to the other handlers. */
+    if (reservation_add(&r) == -1 ||
+        event_set_reserved(ev.eid, ev.seats_reserved + people) == -1) {
+        rc = reply_status(fd, "RRI", "NOK", status);
+        goto done;
     }
-    strncpy(r->uid, uid, 6); r->uid[6] = '\0';
-    r->eid = ev->eid;
-    r->people = people;
-    get_current_timestamp(r->timestamp);  /* Add timestamp */
-    
-    /* Save reservation to disk */
-    save_reservation(r);
-    update_event_reservations(ev->eid, ev->seats_reserved);
-    
-    char tmp[64];
-    snprintf(tmp, sizeof tmp, "RRI ACC\n");
-    *response_buf = strdup(tmp);
-    *response_len = strlen(*response_buf);
-    return 0;
+
+    rc = reply_status(fd, "RRI", "ACC", status);
+
+done:
+    storage_unlock();
+    return rc;
 }
 
-/* cmd_cps: change password
-   signature: int cmd_cps(char **response_buf, size_t *response_len, const char *uid, const char *oldpass, const char *newpass)
-   replies: RCP OK | RCP NLG | RCP NOK | RCP NID
-*/
-int cmd_cps(char **response_buf, size_t *response_len, const char *uid, const char *oldpass, const char *newpass) {
-    if (!response_buf || !response_len || !uid || !oldpass || !newpass) return 1;
-    User *u = find_user(uid);
-    if (!u) {
-        *response_buf = strdup("RCP NID\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    if (!u->logged_in) {
-        *response_buf = strdup("RCP NLG\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    if (strcmp(u->password, oldpass) != 0) {
-        *response_buf = strdup("RCP NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    strncpy(u->password, newpass, sizeof(u->password)-1);
-    
-    /* Save new password to disk */
-    if (save_user_password(uid, newpass) == -1) {
-        *response_buf = strdup("RCP NOK\n");
-        *response_len = strlen(*response_buf);
-        return 0;
-    }
-    
-    *response_buf = strdup("RCP OK\n");
-    *response_len = strlen(*response_buf);
-    return 0;
-}
+/* CPS UID oldPassword newPassword -> RCP OK | RCP NID | RCP NLG | RCP NOK */
+int cmd_cps(int fd, const char *uid, const char *oldpass, const char *newpass, char status[8]) {
+    User u;
+    int rc;
 
+    if (storage_lock(1) == -1) return reply_status(fd, "RCP", "NOK", status);
+
+    if (user_load(uid, &u) == -1)          { rc = reply_status(fd, "RCP", "NID", status); goto done; }
+    if (!u.logged_in)                      { rc = reply_status(fd, "RCP", "NLG", status); goto done; }
+    if (strcmp(u.password, oldpass) != 0)  { rc = reply_status(fd, "RCP", "NOK", status); goto done; }
+
+    rc = (user_set_password(uid, newpass) == -1) ? reply_status(fd, "RCP", "NOK", status)
+                                                 : reply_status(fd, "RCP", "OK", status);
+
+done:
+    storage_unlock();
+    return rc;
+}
